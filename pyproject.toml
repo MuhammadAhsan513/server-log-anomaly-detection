@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "log-anomaly"
-version = "0.3.1"
-description = "Traceable log features, rule-based anomaly detection, and historical baselines"
+version = "0.4.0"
+description = "Traceable log features, rule-based and Isolation Forest anomaly detection"
 requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
 eda = ["matplotlib==3.10.7"]
+ml = ["scikit-learn==1.9.1"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -130,6 +130,73 @@ class DetectionConfig:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class MLConfig:
+    schema_version: str = SCHEMA_VERSION
+    resolutions: tuple[int, ...] = (5, 15)
+    scopes: tuple[str, ...] = ("service", "endpoint", "auth_ip")
+    minimum_records: int = 20
+    minimum_training_windows: int = 100
+    minimum_validation_windows: int = 20
+    n_estimators: int = 200
+    max_samples: int = 256
+    max_features: float = 1.0
+    contamination: str | float = "auto"
+    random_state: int = 42
+    candidate_percentiles: tuple[float, ...] = (95.0, 97.5, 99.0)
+    threshold_percentile: float = 99.0
+    stability_seeds: tuple[int, ...] = (43, 44, 45)
+    training_filter_percentile: float = 99.0
+    daypart_hours: int = 6
+    top_features: int = 3
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SCHEMA_VERSION:
+            raise InputError("unsupported schema_version")
+        for key, allowed in (("resolutions", {5, 15}), ("scopes", {"service", "endpoint", "auth_ip"})):
+            values = getattr(self, key)
+            if (not isinstance(values, (list, tuple)) or not values or len(set(values)) != len(values)
+                    or any(isinstance(v, bool) or v not in allowed for v in values)):
+                raise InputError(f"{key} must be distinct values from {sorted(allowed)}")
+            object.__setattr__(self, key, tuple(values))
+        for key in ("minimum_records", "minimum_training_windows", "minimum_validation_windows",
+                    "n_estimators", "max_samples", "daypart_hours", "top_features"):
+            value = getattr(self, key)
+            if type(value) is not int or value <= 0:
+                raise InputError(f"{key} must be a positive integer")
+        seeds = self.stability_seeds
+        if (type(self.random_state) is not int or self.random_state < 0
+                or not isinstance(seeds, (list, tuple)) or len(set(seeds)) != len(seeds)
+                or any(type(s) is not int or s < 0 or s == self.random_state for s in seeds)):
+            raise InputError("random_state and distinct stability_seeds must be other nonnegative integers")
+        object.__setattr__(self, "stability_seeds", tuple(seeds))
+
+        def number(value):
+            return (not isinstance(value, bool) and isinstance(value, (int, float))
+                    and math.isfinite(value))
+
+        if not number(self.max_features) or not 0 < self.max_features <= 1:
+            raise InputError("max_features must be a fraction in (0, 1]")
+        if self.contamination != "auto" and (not number(self.contamination)
+                                             or not 0 < self.contamination <= 0.5):
+            raise InputError("contamination must be 'auto' or in (0, 0.5]")
+        percentiles = self.candidate_percentiles
+        if (not isinstance(percentiles, (list, tuple)) or not percentiles
+                or len(set(percentiles)) != len(percentiles)
+                or any(not number(p) or not 0 < p < 100 for p in percentiles)):
+            raise InputError("candidate_percentiles must be distinct numbers in (0, 100)")
+        object.__setattr__(self, "candidate_percentiles", tuple(percentiles))
+        if self.threshold_percentile not in self.candidate_percentiles:
+            raise InputError("threshold_percentile must be one of candidate_percentiles")
+        if not number(self.training_filter_percentile) or not 0 < self.training_filter_percentile < 100:
+            raise InputError("training_filter_percentile must be in (0, 100)")
+        if self.daypart_hours > 24 or 24 % self.daypart_hours:
+            raise InputError("daypart_hours must divide 24")
+
+    def to_dict(self) -> dict:
+        return {key: list(value) if isinstance(value, tuple) else value for key, value in asdict(self).items()}
+
+
 def _unique_keys(pairs: list[tuple[str, object]]) -> dict:
     result = {}
     for key, value in pairs:
@@ -139,8 +206,8 @@ def _unique_keys(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
-def load_config(path: Path, config_type: type[IngestConfig] | type[DetectionConfig] = IngestConfig
-                ) -> IngestConfig | DetectionConfig:
+def load_config(path: Path, config_type: type[IngestConfig] | type[DetectionConfig] | type[MLConfig] = IngestConfig
+                ) -> IngestConfig | DetectionConfig | MLConfig:
     try:
         data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_keys)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:

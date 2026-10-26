@@ -1,5 +1,5 @@
-"""Local log features, rule-based anomaly detection, and historical baselines."""
+"""Local log features, rule-based and Isolation Forest anomaly detection."""
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 SCHEMA_VERSION = "1.0"
 PARSER_VERSION = "1.0"

@@ -12,7 +12,7 @@ from importlib.metadata import version
 from pathlib import Path
 
 from . import SCHEMA_VERSION, __version__
-from .config import DetectionConfig, FeatureConfig, IngestConfig, InputError
+from .config import DetectionConfig, FeatureConfig, IngestConfig, InputError, MLConfig
 from .features import build_windows
 from .ingest import Enrichment, IngestionResult, NormalizedLog, read_logs
 from .parse import parse_messages
@@ -319,3 +319,122 @@ def detect(input_path: Path, config: DetectionConfig, output: Path) -> dict:
     print(json_text({"stage": manifest["stage"], "run_id": run_id, "counts": manifest["counts"],
                      "elapsed_seconds": manifest["runtime_seconds"]}), file=sys.stderr)
     return manifest
+
+
+def _read_rule_run(rules: Path, source: dict) -> list[dict]:
+    """Read Phase 3 signals produced from the same feature stream, for comparison only."""
+    try:
+        if rules.name.endswith(".incomplete"):
+            raise InputError("cannot compare with an incomplete rules directory")
+        manifest = json.loads((rules / "manifest.json").read_text(encoding="utf-8"))
+        if (manifest["schema_version"] != SCHEMA_VERSION or manifest["phase"] != 3
+                or manifest["status"] != "complete" or manifest["stage"] != "rules_and_baselines"):
+            raise InputError("rule comparison requires a completed Phase 3 run")
+        if manifest["source_run"]["artifacts"]["windows.jsonl"] != source["artifacts"]["windows.jsonl"]:
+            raise InputError("rules run was produced from a different feature stream")
+        content = (rules / "signals.jsonl").read_bytes()
+        if hashlib.sha256(content).hexdigest() != manifest["artifacts"]["signals.jsonl"]:
+            raise InputError("rules artifact hash mismatch: signals.jsonl")
+        return [json.loads(line) for line in content.decode("utf-8").splitlines()]
+    except InputError:
+        raise
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
+        raise InputError(f"cannot read Phase 3 artifacts: {exc}") from exc
+
+
+def ml(input_path: Path, config: MLConfig, output: Path, rules: Path | None = None) -> dict:
+    """Publish only Phase 4 ML artifacts, retaining hashes/links to the feature and rule runs."""
+    import pickle
+
+    from .ml import fit_and_score
+
+    start = time.perf_counter()
+    staging = output.with_name(output.name + ".incomplete")
+    if output.exists() or staging.exists():
+        raise FileExistsError(f"output or staging path already exists: {output}, {staging}")
+    source, feature_config, windows, records = _read_feature_run(input_path)
+    rule_signals = _read_rule_run(rules, source) if rules is not None else None
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging.mkdir()
+    _write_json(staging / "manifest.json", {
+        "schema_version": SCHEMA_VERSION, "phase": 4, "status": "incomplete", "pipeline_complete": False,
+    })
+    result = fit_and_score(windows, records, source["split_ranges"], feature_config.health_endpoints,
+                           config, rule_signals)
+    (staging / "model").mkdir()
+    _write_json(staging / "config.json", config.to_dict())
+    _write_json(staging / "ml_summary.json", result.summary)
+    _write_json(staging / "model/metadata.json", result.metadata)
+    (staging / "model/estimators.pkl").write_bytes(pickle.dumps(result.estimators, protocol=5))
+    _write_lines(staging / "signals.jsonl", result.signals)
+    with (staging / "signals.jsonl").open(encoding="utf-8") as handle:
+        serialized = [json.loads(line) for line in handle]
+    if serialized != result.signals or len({s["signal_id"] for s in serialized}) != len(serialized):
+        raise ValueError("serialized signals mismatch or duplicate identity")
+    for name, expected in (("ml_summary.json", result.summary), ("model/metadata.json", result.metadata),
+                           ("config.json", config.to_dict())):
+        if json.loads((staging / name).read_text(encoding="utf-8")) != expected:
+            raise ValueError(f"serialized ML artifact mismatch: {name}")
+    if set(pickle.loads((staging / "model/estimators.pkl").read_bytes())) != set(result.metadata["models"]):
+        raise ValueError("serialized estimators do not match model metadata")
+    config_hash = hashlib.sha256(json_text(config.to_dict()).encode()).hexdigest()
+    source_hashes = {name: source["artifacts"][name] for name in ("config.json", "windows.jsonl", "normalized.jsonl")}
+    rules_run = None
+    if rules is not None:
+        rule_manifest = json.loads((rules / "manifest.json").read_text(encoding="utf-8"))
+        rules_run = {"path": str(rules.resolve()), "run_id": rule_manifest["run_id"],
+                     "artifacts": {"signals.jsonl": rule_manifest["artifacts"]["signals.jsonl"]}}
+    run_id = hashlib.sha256(json_text([source_hashes, rules_run and rules_run["artifacts"],
+                                       source["split_ranges"], config_hash, __version__]).encode()).hexdigest()
+    manifest = {
+        "schema_version": SCHEMA_VERSION, "phase": 4, "stage": "ml_baseline",
+        "status": "complete", "pipeline_complete": False, "run_id": run_id,
+        "source_run": {"path": str(input_path.resolve()), "run_id": source["run_id"], "artifacts": source_hashes},
+        "rules_run": rules_run, "input_sha256": source["input_sha256"], "config_sha256": config_hash,
+        "software_version": __version__, "python_version": platform.python_version(),
+        "dependencies": {name: version(name) for name in (
+            "scikit-learn", "numpy", "scipy", "joblib", "cloudpickle", "threadpoolctl", "narwhals")},
+        "timezone": source["timezone"], "seed": config.random_state, "split_ranges": source["split_ranges"],
+        "runtime_seconds": round(time.perf_counter() - start, 6),
+        "counts": {"windows": len(windows), "signals": len(result.signals), "accepted_count": len(records),
+                   "available_models": result.summary["available_models"]},
+        "artifacts": {path.relative_to(staging).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                      for path in sorted(staging.rglob("*")) if path.is_file() and path.name != "manifest.json"},
+    }
+    _write_json(staging / "manifest.json", manifest)
+    if output.exists():
+        raise FileExistsError(f"output appeared during processing: {output}")
+    staging.rename(output)
+    print(json_text({"stage": manifest["stage"], "run_id": run_id, "counts": manifest["counts"],
+                     "elapsed_seconds": manifest["runtime_seconds"]}), file=sys.stderr)
+    return manifest
+
+
+def load_model_bundle(run: Path) -> tuple[dict, dict]:
+    """Load a trusted local Phase 4 bundle after manifest, hash, and version checks."""
+    import pickle
+
+    try:
+        if run.name.endswith(".incomplete"):
+            raise InputError("cannot load a model from an incomplete directory")
+        manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+        if (manifest["schema_version"] != SCHEMA_VERSION or manifest["phase"] != 4
+                or manifest["status"] != "complete" or manifest["stage"] != "ml_baseline"):
+            raise InputError("model loading requires a completed Phase 4 run")
+        if manifest["dependencies"]["scikit-learn"] != version("scikit-learn"):
+            raise InputError("model was built with a different scikit-learn version")
+        content = {}
+        for name in ("model/metadata.json", "model/estimators.pkl"):
+            content[name] = (run / name).read_bytes()
+            if hashlib.sha256(content[name]).hexdigest() != manifest["artifacts"][name]:
+                raise InputError(f"model artifact hash mismatch: {name}")
+        metadata = json.loads(content["model/metadata.json"])
+        # Hash-verified bytes from this project's own publication only.
+        estimators = pickle.loads(content["model/estimators.pkl"])
+        if set(estimators) != set(metadata["models"]):
+            raise InputError("model metadata and estimators disagree")
+        return metadata, estimators
+    except InputError:
+        raise
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError, pickle.UnpicklingError) as exc:
+        raise InputError(f"cannot load Phase 4 model bundle: {exc}") from exc

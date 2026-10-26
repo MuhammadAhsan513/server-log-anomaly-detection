@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "resolutions": [5, 15],
+  "scopes": ["service", "endpoint", "auth_ip"],
+  "minimum_records": 20,
+  "minimum_training_windows": 100,
+  "minimum_validation_windows": 20,
+  "n_estimators": 200,
+  "max_samples": 256,
+  "max_features": 1.0,
+  "contamination": "auto",
+  "random_state": 42,
+  "candidate_percentiles": [95.0, 97.5, 99.0],
+  "threshold_percentile": 99.0,
+  "stability_seeds": [43, 44, 45],
+  "training_filter_percentile": 99.0,
+  "daypart_hours": 6,
+  "top_features": 3
+}

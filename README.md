@@ -3,7 +3,7 @@ Python-based Server Log Analysis and Anomaly Detection Pipeline
 
 ## Project planning
 
-Read the [engineering documentation](docs/README.md) for requirements, system design, implementation phases, data contracts, detection methods, evaluation, and delivery instructions. Phases 1–3 are implemented; ML and incident reporting remain planned.
+Read the [engineering documentation](docs/README.md) for requirements, system design, implementation phases, data contracts, detection methods, evaluation, and delivery instructions. Phases 1–4 are implemented; incident reporting and evaluation remain planned.
 
 ## Phase 1 implementation
 
@@ -65,3 +65,30 @@ Thresholds remain documented starting hypotheses, not production calibration.
 See the [Phase 3 contract](docs/04-data-contracts.md#phase-3-implemented-interface).
 This stage has no additional dependencies, ML, incident grouping, or accuracy
 evaluation; `pipeline_complete` remains false.
+
+## Phase 4: Isolation Forest baseline
+
+```bash
+.venv/bin/python -m pip install -r requirements.lock
+.venv/bin/python -m pip install --no-deps --no-build-isolation -e .
+.venv/bin/python -m log_anomaly ml --input artifacts/phase2-run-001 --config configs/ml.json --rules artifacts/phase3-run-001 --output artifacts/phase4-run-001
+```
+
+The input is a completed Phase 2 directory; `--rules` (optional) is a completed
+Phase 3 run from the same feature stream and is used only for comparison. Use a
+fresh output directory. Outputs are `signals.jsonl` (held-out `multivariate`
+candidates in the Phase 3 signal shape plus `feature_evidence`), `ml_summary.json`,
+`model/metadata.json`, `model/estimators.pkl`, resolved `config.json`, and
+`manifest.json`.
+
+One model is fitted per resolution, scope, and service when at least 100
+training windows have ≥20 business records. Preprocessing (`log1p`, training
+medians, missingness indicators, all-null/constant feature drops, feature order)
+and trees use training windows only. The alert threshold is the validation
+p99 anomaly score (`-score_samples`, strict `>`); test is scored with everything
+frozen. Unsupported models and low-support windows receive no ML score and are
+counted in the summary. Candidate percentiles, seed stability, training-filter
+sensitivity, and rule overlap are reported. No labels exist, so no accuracy
+metrics are computed. See the [Phase 4 contract](docs/04-data-contracts.md#phase-4-implemented-interface).
+`load_model_bundle` reloads only hash-verified bundles built with the installed
+scikit-learn version. `pipeline_complete` remains false.

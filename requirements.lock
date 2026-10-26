@@ -1,4 +1,4 @@
-# Tested on Python 3.14.4; plotting dependencies are needed only for Phase 2.
+# Tested on Python 3.14.4; plotting dependencies are needed only for Phase 2, scikit-learn only for Phase 4.
 setuptools==78.1.1
 pytest==9.0.2
 iniconfig==2.1.0
@@ -16,3 +16,9 @@ pyparsing==3.3.3
 python-dateutil==3.0.0
 six==1.17.0
 tzdata==2026.5
+scikit-learn==1.9.1
+scipy==1.18.1
+joblib==1.6.0
+cloudpickle==3.1.2
+threadpoolctl==3.7.0
+narwhals==2.27.1
