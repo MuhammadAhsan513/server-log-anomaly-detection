@@ -1,0 +1,10 @@
+timestamp,service,log_level,http_status,response_time_ms,endpoint,source_ip,message
+2025-02-03 12:00:02,api-gateway,INFO,200,12,/api/search,192.0.2.7,method=GET path=/api/search?q=tea+cup upstream=search-service upstream_latency_ms=8 req_id=fixture-id
+2025-02-03 12:00:01,search-service,INFO,200,43,/api/search,192.0.2.8,"query=""café, tea"" hits=12 took=43ms shards=6"
+2025-02-03 12:00:01,auth-service,WARN,401,10,/login,192.0.2.9,Login failed for user fixture-user: invalid credentials
+2025-02-03 12:00:02,api-gateway,INFO,200,12,/api/search,192.0.2.7,method=GET path=/api/search?q=tea+cup upstream=search-service upstream_latency_ms=8 req_id=fixture-id
+2025-02-03 12:00:03,new-service,DEBUG,bad,-1,,bad,"Unknown, ""quoted""
+second physical line"
+2025-02-03 12:00:04,orders-service,INFO,200,0,/api/orders,192.0.2.10,
+invalid,orders-service,INFO,200,0,/api/orders,192.0.2.10,bad timestamp
+short,row

@@ -265,3 +265,35 @@ def test_future_training_and_heldout_values_cannot_change_earlier_references(csv
     history.add({**later, "window_start": "2025-02-03T23:05:00", "window_end": "2025-02-03T23:10:00"})
     assert before == history.reference(series_key(later), "p95_latency_ms", later["window_start"], 3)
     assert fit_baselines(features.windows, features.split_ranges["train"], CONFIG) == original.baselines
+
+
+def test_recurring_daily_volume_is_suppressed_but_new_surges_are_not(csv_file, row):
+    """Phase 6 regression: a nightly batch at the same clock time alerted every day."""
+    features_config = FeatureConfig(train_days=3, validation_days=1)
+    rows = []
+    for day in range(5):
+        first = datetime(2025, 2, 3 + day)
+        rows += [r for i in range(72) for r in batch(row, (first + timedelta(minutes=5 * i)).isoformat(sep=" "))]
+        rows += batch(row, (first + timedelta(hours=3)).isoformat(sep=" "), count=60, endpoint="/api/export")
+    rows += batch(row, "2025-02-07 05:00:00", count=60, endpoint="/api/products")  # one-off, new time of day
+    features, records = prepared(csv_file, row, rows, features_config)
+
+    def surges(config):
+        result = run(features, records, config, features_config)
+        return result, {(s["window_minutes"], s["window_start"]) for s in for_detector(
+            result, "traffic_surge", scope="service", service=row["service"]) if s["split"] != "train"}
+
+    _, before = surges(replace(CONFIG, traffic_recurrence_days=0))
+    result, after = surges(CONFIG)
+    assert {(5, "2025-02-06T03:00:00"), (5, "2025-02-07T03:00:00"), (5, "2025-02-07T05:00:00")} <= before
+    assert after == {(5, "2025-02-07T05:00:00"), (15, "2025-02-07T05:00:00")}
+    signal = next(s for s in for_detector(result, "traffic_surge", window_minutes=5)
+                  if s["window_start"] == "2025-02-07T05:00:00")
+    context = signal["baseline_metrics"]["time_of_day_recurrence"]
+    assert (context["status"], context["prior_days"], context["cutoff"]) == ("available", 3, "2025-02-06T00:00:00")
+    assert context["same_time_max"] == 20 and "same-time-of-day maximum 20" in signal["explanation"]
+    suppressed = [d for d in result.diagnostics["decision_counts"] if d["reason"] == "recurring_time_of_day"]
+    assert {d["split"] for d in suppressed} == {"train", "validation", "test"}
+    # Training days without enough prior days keep alerting, with the limitation stated.
+    first_day = [s for s in for_detector(result, "traffic_surge") if s["window_start"] == "2025-02-03T03:00:00"]
+    assert first_day and any("recurrence context unavailable" in t for t in first_day[0]["limitations"])

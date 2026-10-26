@@ -74,6 +74,44 @@ class History:
         }
 
 
+class Recurrence:
+    """Same-clock-time business volume on prior training days (service scope only)."""
+
+    def __init__(self, config: DetectionConfig):
+        self.config = config
+        self.counts = defaultdict(dict)
+
+    def add(self, window: dict) -> None:
+        if window["split"] != "train":
+            raise ValueError("only training windows may update history")
+        if window["scope"] == "service":
+            self.counts[series_key(window)][window["window_start"]] = (
+                window["window_end"], window["business"]["record_count"])
+
+    def reference(self, key: tuple, window_start: str, cutoff: str) -> dict:
+        """Maximum count within the tolerance at the same clock time on earlier days ending by cutoff."""
+        config = self.config
+        current = datetime.fromisoformat(window_start)
+        lower = (datetime.fromisoformat(cutoff) - timedelta(days=config.traffic_recurrence_days)).isoformat()
+        tolerance = config.traffic_recurrence_tolerance_minutes
+        counts = self.counts.get(key, {})
+        days, peak = set(), None
+        last_day = (current - datetime.fromisoformat(lower)).days + 1
+        for back in range(1, last_day + 1):
+            for offset in range(-tolerance, tolerance + 1, key[0]):
+                start = (current - timedelta(days=back, minutes=offset)).isoformat()
+                found = counts.get(start)
+                if found is None or start < lower or found[0] > cutoff:
+                    continue
+                days.add(back)
+                peak = found[1] if peak is None else max(peak, found[1])
+        available = len(days) >= config.traffic_recurrence_minimum_days
+        return {"status": "available" if available else "recurrence_unavailable", "prior_days": len(days),
+                "minimum_days": config.traffic_recurrence_minimum_days, "same_time_max": peak if available else None,
+                "tolerance_minutes": tolerance, "ratio": config.traffic_recurrence_ratio, "cutoff": cutoff,
+                "history_start": lower}
+
+
 def fit_baselines(windows: list[dict], train_range: dict, config: DetectionConfig) -> dict:
     """Freeze final training history for every daypart; ignore held-out values."""
     history = History(config)

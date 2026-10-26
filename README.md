@@ -3,7 +3,7 @@ Python-based Server Log Analysis and Anomaly Detection Pipeline
 
 ## Project planning
 
-Read the [engineering documentation](docs/README.md) for requirements, system design, implementation phases, data contracts, detection methods, evaluation, and delivery instructions. Phases 1–4 are implemented; incident reporting and evaluation remain planned.
+Read the [engineering documentation](docs/README.md) for requirements, system design, implementation phases, data contracts, detection methods, evaluation, and delivery instructions. Phases 1–5 are implemented; evaluation and packaging remain planned.
 
 ## Phase 1 implementation
 
@@ -92,3 +92,23 @@ sensitivity, and rule overlap are reported. No labels exist, so no accuracy
 metrics are computed. See the [Phase 4 contract](docs/04-data-contracts.md#phase-4-implemented-interface).
 `load_model_bundle` reloads only hash-verified bundles built with the installed
 scikit-learn version. `pipeline_complete` remains false.
+
+## Phase 5: grouped incident reports
+
+```bash
+.venv/bin/python -m log_anomaly incidents --input artifacts/phase2-run-001 --rules artifacts/phase3-run-001 --ml artifacts/phase4-run-001 --config configs/incidents.json --output artifacts/phase5-run-001
+```
+
+Inputs are completed Phase 2, 3, and 4 runs from the same feature stream;
+mismatched or incomplete runs are rejected (exit 2). Use a fresh output
+directory. Outputs are `incidents.json` (authoritative), `incidents.csv`,
+`summary.md`, `charts/incidents.png`, resolved `config.json`, and `manifest.json`.
+
+Signals are grouped by category, scope, service, entity, and split, merging
+windows within a five-minute gap. ML signals join a rule incident only when their
+top feature increases describe the same category; otherwise they remain
+`multivariate` candidates. Severity `review` marks suspicious activity (ML-only
+or traffic); `warning`/`high` mark rule-supported incident candidates. Confidence
+is `low` (ML-only), `medium` (rules), or `high` (rules plus ML). No incident is
+confirmed: there are no labels. See the
+[Phase 5 contract](docs/04-data-contracts.md#phase-5-implemented-interface).

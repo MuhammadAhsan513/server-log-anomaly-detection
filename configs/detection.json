@@ -21,5 +21,9 @@
   "error_robust_score": 4.0,
   "traffic_minimum_count": 30,
   "traffic_robust_score": 4.0,
+  "traffic_recurrence_days": 7,
+  "traffic_recurrence_minimum_days": 2,
+  "traffic_recurrence_tolerance_minutes": 15,
+  "traffic_recurrence_ratio": 1.25,
   "health_minimum_failures": 2
 }

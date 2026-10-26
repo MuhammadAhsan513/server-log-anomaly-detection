@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 
-from .baselines import History, daypart, fit_baselines, robust_score, series_key
+from .baselines import History, Recurrence, daypart, fit_baselines, robust_score, series_key
 from .config import DetectionConfig
 from .features import _health_status
 from .ingest import NormalizedLog
@@ -16,7 +16,7 @@ DETECTOR_VERSION = "1.0"
 
 
 def _explanation(detector: str, window: dict, observed: dict, threshold: dict,
-                 support: int, reference: dict | None) -> str:
+                 support: int, reference: dict | None, context: dict | None = None) -> str:
     if detector == "http_error_burst":
         reason = (f"{observed['http_5xx_count']} business HTTP 5xx responses among {support} valid statuses "
                   f"({observed['http_5xx_rate']:.1%}) met the count ≥{threshold['count_gte']} and "
@@ -41,6 +41,9 @@ def _explanation(detector: str, window: dict, observed: dict, threshold: dict,
         reason = (f"{support} business records had robust count score "
                   f"{observed['robust_score']:.2f} >{threshold['robust_score_gt']}, "
                   f"with count ≥{threshold['count_gte']}")
+        if context and context["status"] == "available":
+            reason += (f", and exceeded {context['ratio']}× the same-time-of-day maximum "
+                       f"{context['same_time_max']} over {context['prior_days']} prior training days")
     else:
         reason = (f"{observed['failure_count']} explicit failed health checks among {support} known-status "
                   f"checks met the count ≥{threshold['failure_count_gte']} limit")
@@ -106,6 +109,7 @@ def detect_rules(windows: list[dict], records: list[NormalizedLog], split_ranges
     frozen = {series_key(r) + (r["metric"], r["daypart"]): r for r in baselines["references"]}
     history = History(config)
     empty_history = History(config)
+    volumes = Recurrence(config)
     evidence = Evidence(records, health_endpoints)
     signals = []
     counts = Counter()
@@ -129,7 +133,7 @@ def detect_rules(windows: list[dict], records: list[NormalizedLog], split_ranges
             return references[metric]
 
         def assess(detector, category, population, value, support, minimum, threshold,
-                   observed, triggered, metric=None, needs_baseline=False):
+                   observed, triggered, metric=None, needs_baseline=False, suppress=None, context=None):
             ref = reference(metric) if metric else None
             if value is None:
                 reason = "missing_metric"
@@ -140,7 +144,8 @@ def detect_rules(windows: list[dict], records: list[NormalizedLog], split_ranges
             elif not triggered:
                 reason = "below_threshold"
             else:
-                reason = "emitted"
+                # A suppression returns its reason, e.g. a recurring same-time-of-day pattern.
+                reason = (suppress and suppress()) or "emitted"
             counts[(detector, window["service"], window["scope"], window["window_minutes"],
                     window["split"], part, reason)] += 1
             if reason != "emitted":
@@ -160,6 +165,10 @@ def detect_rules(windows: list[dict], records: list[NormalizedLog], split_ranges
                 limitations.append("Weekly seasonality is not established.")
             if category == "traffic":
                 limitations.append("Volume change alone does not establish an outage.")
+            if context and context["status"] != "available":
+                limitations.append(f"Time-of-day recurrence context unavailable (fewer than "
+                                   f"{context['minimum_days']} prior training days); a recurring daily "
+                                   f"pattern cannot be excluded.")
             if category == "auth_failures":
                 limitations.append("Repeated failures do not establish an attack or identify a user.")
             identity = [detector, DETECTOR_VERSION, *series_key(window), window["window_start"],
@@ -171,9 +180,11 @@ def detect_rules(windows: list[dict], records: list[NormalizedLog], split_ranges
                 "service": window["service"], "window_start": window["window_start"],
                 "window_end": window["window_end"], "window_minutes": window["window_minutes"],
                 "split": window["split"], "score": observed.get("robust_score", value), "threshold": threshold,
-                "observed_metrics": observed, "baseline_metrics": {metric: ref} if ref else {"status": "not_required"},
+                "observed_metrics": observed,
+                "baseline_metrics": ({metric: ref, **({"time_of_day_recurrence": context} if context else {})}
+                                     if ref else {"status": "not_required"}),
                 "support_count": support, "evidence_record_ids": ids, "limitations": limitations,
-                "explanation": _explanation(detector, window, observed, threshold, support, ref),
+                "explanation": _explanation(detector, window, observed, threshold, support, ref, context),
             })
 
         if window["scope"] in {"service", "endpoint"}:
@@ -214,11 +225,25 @@ def detect_rules(windows: list[dict], records: list[NormalizedLog], split_ranges
                    "error_rate", True)
             count = business["record_count"]
             score = robust_score(count, reference("record_count"))
+            recurrence = {}
+
+            def recurring():
+                # Prior training days only: preceding days in training, frozen at training end for held-out.
+                cutoff = window["window_start"] if window["split"] == "train" else split_ranges["train"]["end"]
+                recurrence.update(volumes.reference(series_key(window), window["window_start"], cutoff))
+                if (recurrence["status"] == "available"
+                        and count <= config.traffic_recurrence_ratio * recurrence["same_time_max"]):
+                    return "recurring_time_of_day"
+                return None
+
+            enabled = config.traffic_recurrence_days > 0
             assess("traffic_surge", "traffic", "business", count, count, config.minimum_records,
                    {"count_gte": config.traffic_minimum_count, "robust_score_gt": config.traffic_robust_score,
-                    "minimum_records": config.minimum_records}, {"record_count": count, "robust_score": score},
+                    "minimum_records": config.minimum_records,
+                    **({"same_time_of_day_ratio_gt": config.traffic_recurrence_ratio} if enabled else {})},
+                   {"record_count": count, "robust_score": score},
                    count >= config.traffic_minimum_count and score is not None and score > config.traffic_robust_score,
-                   "record_count", True)
+                   "record_count", True, recurring if enabled else None, recurrence if enabled else None)
             if window["window_minutes"] == 15:
                 assess("health_failure", "health", "health", health["failure_rate"],
                        health["failure_valid_count"], config.health_minimum_failures,
@@ -239,6 +264,7 @@ def detect_rules(windows: list[dict], records: list[NormalizedLog], split_ranges
                    and rate >= config.auth_failure_rate)
         if window["split"] == "train":
             history.add(window)
+            volumes.add(window)
 
     fields = ("detector_id", "service", "scope", "window_minutes", "split", "daypart", "reason")
     diagnostics = {

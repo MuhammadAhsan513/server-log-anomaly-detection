@@ -1,0 +1,7 @@
+{
+  "schema_version": "1.0",
+  "iou_threshold": 0.3,
+  "sensitivity_iou_thresholds": [0.1, 0.5],
+  "splits": ["validation", "test"],
+  "primary_split": "test"
+}

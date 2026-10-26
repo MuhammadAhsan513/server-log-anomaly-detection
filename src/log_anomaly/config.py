@@ -99,21 +99,30 @@ class DetectionConfig:
     error_robust_score: float = 4.0
     traffic_minimum_count: int = 30
     traffic_robust_score: float = 4.0
+    # Same-time-of-day context from prior training days; 0 days disables it.
+    traffic_recurrence_days: int = 7
+    traffic_recurrence_minimum_days: int = 2
+    traffic_recurrence_tolerance_minutes: int = 15
+    traffic_recurrence_ratio: float = 1.25
     health_minimum_failures: int = 2
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
             raise InputError("unsupported schema_version")
+        nonnegative_keys = {"traffic_recurrence_days", "traffic_recurrence_tolerance_minutes"}
         integer_keys = {
             "history_hours", "minimum_history_windows", "daypart_hours", "minimum_statuses",
             "http_minimum_errors", "minimum_auth_attempts", "auth_minimum_failures",
             "minimum_latencies", "minimum_records", "error_minimum_count",
-            "traffic_minimum_count", "health_minimum_failures",
+            "traffic_minimum_count", "health_minimum_failures", "traffic_recurrence_minimum_days",
         }
         for key, value in asdict(self).items():
             if key == "schema_version":
                 continue
-            if key in integer_keys:
+            if key in nonnegative_keys:
+                if type(value) is not int or value < 0:
+                    raise InputError(f"{key} must be a nonnegative integer")
+            elif key in integer_keys:
                 if type(value) is not int or value <= 0:
                     raise InputError(f"{key} must be a positive integer")
             elif (isinstance(value, bool) or not isinstance(value, (float, int))
@@ -121,8 +130,10 @@ class DetectionConfig:
                 raise InputError(f"{key} must be finite and positive")
         if self.daypart_hours > 24 or 24 % self.daypart_hours:
             raise InputError("daypart_hours must divide 24")
-        if self.history_hours > 24 * 365:
-            raise InputError("history_hours must not exceed one year")
+        if self.history_hours > 24 * 365 or self.traffic_recurrence_days > 365:
+            raise InputError("history_hours and traffic_recurrence_days must not exceed one year")
+        if self.traffic_recurrence_tolerance_minutes >= 12 * 60:
+            raise InputError("traffic_recurrence_tolerance_minutes must be under twelve hours")
         if any(getattr(self, key) > 1 for key in ("http_error_rate", "auth_failure_rate", "rate_epsilon")):
             raise InputError("rates must be in (0, 1]")
 
@@ -197,6 +208,74 @@ class MLConfig:
         return {key: list(value) if isinstance(value, tuple) else value for key, value in asdict(self).items()}
 
 
+@dataclass(frozen=True)
+class IncidentConfig:
+    schema_version: str = SCHEMA_VERSION
+    merge_gap_minutes: int = 5
+    sample_evidence_limit: int = 5
+    high_minimum_minutes: int = 15
+    high_http_5xx_rate: float = 0.5
+    high_minimum_statuses: int = 30
+    review_categories: tuple[str, ...] = ("traffic",)
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SCHEMA_VERSION:
+            raise InputError("unsupported schema_version")
+        gap = self.merge_gap_minutes
+        if type(gap) is not int or gap < 0 or gap % 5:
+            raise InputError("merge_gap_minutes must be a nonnegative multiple of five")
+        for key in ("sample_evidence_limit", "high_minimum_minutes", "high_minimum_statuses"):
+            value = getattr(self, key)
+            if type(value) is not int or value <= 0:
+                raise InputError(f"{key} must be a positive integer")
+        rate = self.high_http_5xx_rate
+        if (isinstance(rate, bool) or not isinstance(rate, (int, float))
+                or not math.isfinite(rate) or not 0 < rate <= 1):
+            raise InputError("high_http_5xx_rate must be in (0, 1]")
+        allowed = {"http_errors", "service_errors", "auth_failures", "latency", "traffic", "health"}
+        categories = self.review_categories
+        if (not isinstance(categories, (list, tuple)) or len(set(categories)) != len(categories)
+                or any(c not in allowed for c in categories)):
+            raise InputError(f"review_categories must be distinct values from {sorted(allowed)}")
+        object.__setattr__(self, "review_categories", tuple(categories))
+
+    def to_dict(self) -> dict:
+        return {**asdict(self), "review_categories": list(self.review_categories)}
+
+
+@dataclass(frozen=True)
+class EvaluationConfig:
+    schema_version: str = SCHEMA_VERSION
+    iou_threshold: float = 0.3
+    sensitivity_iou_thresholds: tuple[float, ...] = (0.1, 0.5)
+    splits: tuple[str, ...] = ("validation", "test")
+    primary_split: str = "test"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SCHEMA_VERSION:
+            raise InputError("unsupported schema_version")
+
+        def fraction(value):
+            return (not isinstance(value, bool) and isinstance(value, (int, float))
+                    and math.isfinite(value) and 0 < value <= 1)
+
+        thresholds = self.sensitivity_iou_thresholds
+        if not fraction(self.iou_threshold) or (
+                not isinstance(thresholds, (list, tuple)) or len(set(thresholds)) != len(thresholds)
+                or any(not fraction(t) or t == self.iou_threshold for t in thresholds)):
+            raise InputError("IoU thresholds must be distinct numbers in (0, 1]")
+        splits = self.splits
+        if (not isinstance(splits, (list, tuple)) or not splits or len(set(splits)) != len(splits)
+                or any(s not in {"train", "validation", "test"} for s in splits)
+                or self.primary_split not in splits):
+            raise InputError("splits must be distinct train/validation/test names including primary_split")
+        object.__setattr__(self, "sensitivity_iou_thresholds", tuple(thresholds))
+        object.__setattr__(self, "splits", tuple(splits))
+
+    def to_dict(self) -> dict:
+        return {key: list(value) if isinstance(value, tuple) else value for key, value in asdict(self).items()}
+
+
 def _unique_keys(pairs: list[tuple[str, object]]) -> dict:
     result = {}
     for key, value in pairs:
@@ -206,8 +285,9 @@ def _unique_keys(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
-def load_config(path: Path, config_type: type[IngestConfig] | type[DetectionConfig] | type[MLConfig] = IngestConfig
-                ) -> IngestConfig | DetectionConfig | MLConfig:
+def load_config(path: Path, config_type: type[IngestConfig] | type[DetectionConfig] | type[MLConfig]
+                | type[IncidentConfig] | type[EvaluationConfig] = IngestConfig
+                ) -> IngestConfig | DetectionConfig | MLConfig | IncidentConfig | EvaluationConfig:
     try:
         data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_keys)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:

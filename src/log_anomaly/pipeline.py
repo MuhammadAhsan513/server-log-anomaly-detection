@@ -12,7 +12,8 @@ from importlib.metadata import version
 from pathlib import Path
 
 from . import SCHEMA_VERSION, __version__
-from .config import DetectionConfig, FeatureConfig, IngestConfig, InputError, MLConfig
+from .config import (DetectionConfig, EvaluationConfig, FeatureConfig, IncidentConfig, IngestConfig, InputError,
+                     MLConfig)
 from .features import build_windows
 from .ingest import Enrichment, IngestionResult, NormalizedLog, read_logs
 from .parse import parse_messages
@@ -321,25 +322,30 @@ def detect(input_path: Path, config: DetectionConfig, output: Path) -> dict:
     return manifest
 
 
-def _read_rule_run(rules: Path, source: dict) -> list[dict]:
-    """Read Phase 3 signals produced from the same feature stream, for comparison only."""
+def _read_signal_run(run: Path, source: dict, phase: int, stage: str, label: str) -> tuple[dict, list[dict]]:
+    """Read a completed signal stage produced from the same feature stream, verifying its hash."""
     try:
-        if rules.name.endswith(".incomplete"):
-            raise InputError("cannot compare with an incomplete rules directory")
-        manifest = json.loads((rules / "manifest.json").read_text(encoding="utf-8"))
-        if (manifest["schema_version"] != SCHEMA_VERSION or manifest["phase"] != 3
-                or manifest["status"] != "complete" or manifest["stage"] != "rules_and_baselines"):
-            raise InputError("rule comparison requires a completed Phase 3 run")
+        if run.name.endswith(".incomplete"):
+            raise InputError(f"cannot read an incomplete {label} directory")
+        manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+        if (manifest["schema_version"] != SCHEMA_VERSION or manifest["phase"] != phase
+                or manifest["status"] != "complete" or manifest["stage"] != stage):
+            raise InputError(f"{label} input requires a completed Phase {phase} run")
         if manifest["source_run"]["artifacts"]["windows.jsonl"] != source["artifacts"]["windows.jsonl"]:
-            raise InputError("rules run was produced from a different feature stream")
-        content = (rules / "signals.jsonl").read_bytes()
+            raise InputError(f"{label} run was produced from a different feature stream")
+        content = (run / "signals.jsonl").read_bytes()
         if hashlib.sha256(content).hexdigest() != manifest["artifacts"]["signals.jsonl"]:
-            raise InputError("rules artifact hash mismatch: signals.jsonl")
-        return [json.loads(line) for line in content.decode("utf-8").splitlines()]
+            raise InputError(f"{label} artifact hash mismatch: signals.jsonl")
+        return manifest, [json.loads(line) for line in content.decode("utf-8").splitlines()]
     except InputError:
         raise
     except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
-        raise InputError(f"cannot read Phase 3 artifacts: {exc}") from exc
+        raise InputError(f"cannot read Phase {phase} artifacts: {exc}") from exc
+
+
+def _read_rule_run(rules: Path, source: dict) -> list[dict]:
+    """Read Phase 3 signals produced from the same feature stream, for comparison only."""
+    return _read_signal_run(rules, source, 3, "rules_and_baselines", "rules")[1]
 
 
 def ml(input_path: Path, config: MLConfig, output: Path, rules: Path | None = None) -> dict:
@@ -406,6 +412,197 @@ def ml(input_path: Path, config: MLConfig, output: Path, rules: Path | None = No
         raise FileExistsError(f"output appeared during processing: {output}")
     staging.rename(output)
     print(json_text({"stage": manifest["stage"], "run_id": run_id, "counts": manifest["counts"],
+                     "elapsed_seconds": manifest["runtime_seconds"]}), file=sys.stderr)
+    return manifest
+
+
+def report_incidents(input_path: Path, config: IncidentConfig, output: Path, rules: Path, ml_run: Path) -> dict:
+    """Publish Phase 5 grouped incidents from existing Phase 3 and Phase 4 signals of one feature run."""
+    import csv
+
+    from .incidents import (group_incidents, incident_counts, incidents_csv, report_limitations,
+                            summary_markdown, validate_incident_report, validate_signals)
+    from .report import write_incident_chart
+
+    start = time.perf_counter()
+    staging = output.with_name(output.name + ".incomplete")
+    if output.exists() or staging.exists():
+        raise FileExistsError(f"output or staging path already exists: {output}, {staging}")
+    source, _, windows, records = _read_feature_run(input_path)
+    rule_manifest, rule_signals = _read_signal_run(rules, source, 3, "rules_and_baselines", "rules")
+    ml_manifest, ml_signals = _read_signal_run(ml_run, source, 4, "ml_baseline", "ML")
+    source_hashes = {name: source["artifacts"][name] for name in ("config.json", "windows.jsonl", "normalized.jsonl")}
+    for label, manifest in (("rules", rule_manifest), ("ML", ml_manifest)):
+        if (manifest["source_run"]["artifacts"] != source_hashes or manifest["split_ranges"] != source["split_ranges"]
+                or manifest["input_sha256"] != source["input_sha256"] or manifest["timezone"] != source["timezone"]):
+            raise InputError(f"{label} run is incompatible with the feature run (artifacts, splits, input or timezone)")
+    rule_hash = rule_manifest["artifacts"]["signals.jsonl"]
+    if ml_manifest["rules_run"] is not None and ml_manifest["rules_run"]["artifacts"]["signals.jsonl"] != rule_hash:
+        raise InputError("ML run was compared against a different rules run")
+    validate_signals(rule_signals, ml_signals, source["split_ranges"], {r.record_id for r in records})
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging.mkdir()
+    _write_json(staging / "manifest.json", {
+        "schema_version": SCHEMA_VERSION, "phase": 5, "status": "incomplete", "pipeline_complete": False,
+    })
+    config_hash = hashlib.sha256(json_text(config.to_dict()).encode()).hexdigest()
+    ml_hash = ml_manifest["artifacts"]["signals.jsonl"]
+    run_id = hashlib.sha256(json_text([source_hashes, rule_hash, ml_hash, source["split_ranges"],
+                                       config_hash, __version__]).encode()).hexdigest()
+    incidents = group_incidents(rule_signals, ml_signals, records, config)
+    report = {"schema_version": SCHEMA_VERSION, "run_id": run_id, "timezone": source["timezone"],
+              "incidents": incidents, "limitations": report_limitations(source["timezone"])}
+    validate_incident_report(report, config)
+    counts = incident_counts(rule_signals, ml_signals, incidents)
+    _write_json(staging / "config.json", config.to_dict())
+    _write_json(staging / "incidents.json", report)
+    (staging / "incidents.csv").write_text(incidents_csv(incidents), encoding="utf-8", newline="")
+    (staging / "summary.md").write_text(summary_markdown(report, counts), encoding="utf-8")
+    write_incident_chart(windows, incidents, staging / "charts/incidents.png", source["timezone"])
+    # Read back JSON and CSV before publication, including the no-incident case.
+    serialized = json.loads((staging / "incidents.json").read_text(encoding="utf-8"))
+    validate_incident_report(serialized, config)
+    with (staging / "incidents.csv").open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if serialized != report or [r["incident_id"] for r in rows] != [i["incident_id"] for i in incidents]:
+        raise ValueError("serialized incident reports disagree")
+    if json.loads((staging / "config.json").read_text(encoding="utf-8")) != config.to_dict():
+        raise ValueError("serialized incident artifact mismatch: config.json")
+    manifest = {
+        "schema_version": SCHEMA_VERSION, "phase": 5, "stage": "incident_reports",
+        "status": "complete", "pipeline_complete": False, "run_id": run_id,
+        "source_run": {"path": str(input_path.resolve()), "run_id": source["run_id"], "artifacts": source_hashes},
+        "rules_run": {"path": str(rules.resolve()), "run_id": rule_manifest["run_id"],
+                      "artifacts": {"signals.jsonl": rule_hash}},
+        "ml_run": {"path": str(ml_run.resolve()), "run_id": ml_manifest["run_id"],
+                   "artifacts": {"signals.jsonl": ml_hash}},
+        "input_sha256": source["input_sha256"], "config_sha256": config_hash,
+        "software_version": __version__, "python_version": platform.python_version(),
+        "dependencies": {"matplotlib": version("matplotlib")},
+        "timezone": source["timezone"], "seed": None, "split_ranges": source["split_ranges"],
+        "runtime_seconds": round(time.perf_counter() - start, 6), "counts": counts,
+        "artifacts": {path.relative_to(staging).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                      for path in sorted(staging.rglob("*")) if path.is_file() and path.name != "manifest.json"},
+    }
+    _write_json(staging / "manifest.json", manifest)
+    if output.exists():
+        raise FileExistsError(f"output appeared during processing: {output}")
+    staging.rename(output)
+    print(json_text({"stage": manifest["stage"], "run_id": run_id, "counts": {
+        k: counts[k] for k in ("rule_signals", "ml_signals", "incidents", "rule_only", "ml_only", "corroborated")},
+        "elapsed_seconds": manifest["runtime_seconds"]}), file=sys.stderr)
+    return manifest
+
+
+def evaluate(input_path: Path, config: EvaluationConfig, output: Path, labels_path: Path) -> dict:
+    """Publish Phase 6 rules/ML/combined metrics for a completed Phase 5 run against fixture labels."""
+    from .evaluate import evaluate_incidents, summary_markdown, validate_labels
+    from .incidents import group_incidents
+
+    start = time.perf_counter()
+    staging = output.with_name(output.name + ".incomplete")
+    if output.exists() or staging.exists():
+        raise FileExistsError(f"output or staging path already exists: {output}, {staging}")
+    try:
+        if input_path.name.endswith(".incomplete"):
+            raise InputError("cannot evaluate an incomplete directory")
+        report_manifest = json.loads((input_path / "manifest.json").read_text(encoding="utf-8"))
+        if (report_manifest["schema_version"] != SCHEMA_VERSION or report_manifest["phase"] != 5
+                or report_manifest["status"] != "complete" or report_manifest["stage"] != "incident_reports"):
+            raise InputError("evaluation requires a completed Phase 5 incident run")
+        content = {name: (input_path / name).read_bytes() for name in ("incidents.json", "config.json")}
+        if any(hashlib.sha256(v).hexdigest() != report_manifest["artifacts"][k] for k, v in content.items()):
+            raise InputError("incident artifact hash mismatch")
+        published = json.loads(content["incidents.json"])
+        incident_config = IncidentConfig(**json.loads(content["config.json"]))
+        label_bytes = labels_path.read_bytes()
+        labels = json.loads(label_bytes)
+        events = validate_labels(labels)
+        source_path = Path(report_manifest["source_run"]["path"])
+        rules_path, ml_path = (Path(report_manifest[k]["path"]) for k in ("rules_run", "ml_run"))
+    except InputError:
+        raise
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
+        raise InputError(f"cannot read Phase 5 run or labels: {exc}") from exc
+    source, _, windows, records = _read_feature_run(source_path)
+    rule_manifest, rule_signals = _read_signal_run(rules_path, source, 3, "rules_and_baselines", "rules")
+    ml_manifest, ml_signals = _read_signal_run(ml_path, source, 4, "ml_baseline", "ML")
+    if (source["run_id"] != report_manifest["source_run"]["run_id"]
+            or rule_manifest["artifacts"]["signals.jsonl"] != report_manifest["rules_run"]["artifacts"]["signals.jsonl"]
+            or ml_manifest["artifacts"]["signals.jsonl"] != report_manifest["ml_run"]["artifacts"]["signals.jsonl"]):
+        raise InputError("Phase 5 run no longer matches its source feature, rules, or ML runs")
+    try:
+        summary_bytes = (ml_path / "ml_summary.json").read_bytes()
+        rule_config = DetectionConfig(**json.loads((rules_path / "config.json").read_text(encoding="utf-8")))
+        ml_config = MLConfig(**json.loads((ml_path / "config.json").read_text(encoding="utf-8")))
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        raise InputError(f"cannot read rules/ML configuration: {exc}") from exc
+    if hashlib.sha256(summary_bytes).hexdigest() != ml_manifest["artifacts"]["ml_summary.json"]:
+        raise InputError("ML artifact hash mismatch: ml_summary.json")
+    ml_models = {m["model_key"]: m["status"] if m["status"] == "available" else f"unavailable: {m['reason']}"
+                 for m in json.loads(summary_bytes)["models"]}
+    # Each mode regroups with the same Phase 5 code and configuration, so matching is identical.
+    modes = {"rules": group_incidents(rule_signals, [], records, incident_config),
+             "ml": group_incidents([], ml_signals, records, incident_config),
+             "combined": group_incidents(rule_signals, ml_signals, records, incident_config)}
+    if modes["combined"] != published["incidents"]:
+        raise InputError("regrouped combined incidents differ from the published Phase 5 report")
+    guards = {"minimum_records": rule_config.minimum_records, "minimum_statuses": rule_config.minimum_statuses,
+              "minimum_latencies": rule_config.minimum_latencies,
+              "minimum_auth_attempts": rule_config.minimum_auth_attempts,
+              "ml_minimum_records": ml_config.minimum_records}
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging.mkdir()
+    _write_json(staging / "manifest.json", {
+        "schema_version": SCHEMA_VERSION, "phase": 6, "status": "incomplete", "pipeline_complete": False,
+    })
+    label_hash = hashlib.sha256(label_bytes).hexdigest()
+    result = evaluate_incidents(modes, events, source["split_ranges"], config, ml_signals, rule_signals,
+                                windows, ml_models, guards, labels.get("normal_patterns", []))
+    evaluation = {
+        "schema_version": SCHEMA_VERSION, "config": config.to_dict(),
+        "labels": {"path": str(labels_path), "sha256": label_hash, "seed": labels.get("seed"),
+                   "generator": labels.get("generator"), "generator_version": labels.get("generator_version")},
+        "split_ranges": source["split_ranges"],
+        "incident_counts": {mode: dict(sorted(Counter(i["split"] for i in incidents).items()))
+                            for mode, incidents in modes.items()},
+        "ml_models": ml_models, **result,
+        "limitations": [
+            "Metrics describe synthetic labelled fixtures only, not the unlabelled supplied logs.",
+            "Every unmatched prediction counts as a false positive, including extra scopes or categories of a "
+            "labelled event (fp_kind duplicate_of_labelled_event).",
+            "Validation-split ML alerts lie in the threshold-calibration day; the primary split is fully held out.",
+            "recurring_normal_pattern uses fixture metadata to explain false positives; it never affects matching.",
+        ],
+    }
+    _write_json(staging / "config.json", config.to_dict())
+    _write_json(staging / "evaluation.json", evaluation)
+    (staging / "summary.md").write_text(summary_markdown(evaluation), encoding="utf-8")
+    if json.loads((staging / "evaluation.json").read_text(encoding="utf-8")) != evaluation:
+        raise ValueError("serialized evaluation mismatch")
+    config_hash = hashlib.sha256(json_text(config.to_dict()).encode()).hexdigest()
+    run_id = hashlib.sha256(json_text([report_manifest["run_id"], label_hash, config_hash, __version__]).encode()).hexdigest()
+    primary = result["results"][config.primary_split]
+    manifest = {
+        "schema_version": SCHEMA_VERSION, "phase": 6, "stage": "evaluation", "status": "complete",
+        "pipeline_complete": False, "run_id": run_id,
+        "incident_run": {"path": str(input_path.resolve()), "run_id": report_manifest["run_id"],
+                         "artifacts": {"incidents.json": report_manifest["artifacts"]["incidents.json"]}},
+        "labels": {"path": str(labels_path.resolve()), "sha256": label_hash},
+        "input_sha256": source["input_sha256"], "config_sha256": config_hash,
+        "software_version": __version__, "python_version": platform.python_version(),
+        "dependencies": {name: version(name) for name in ("numpy", "scipy")},
+        "timezone": source["timezone"], "seed": labels.get("seed"), "split_ranges": source["split_ranges"],
+        "runtime_seconds": round(time.perf_counter() - start, 6),
+        "counts": {mode: {k: primary[mode][k] for k in ("expected", "predicted", "tp", "fp", "fn")} for mode in modes},
+        "artifacts": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                      for path in sorted(staging.iterdir()) if path.name != "manifest.json"},
+    }
+    _write_json(staging / "manifest.json", manifest)
+    if output.exists():
+        raise FileExistsError(f"output appeared during processing: {output}")
+    staging.rename(output)
+    print(json_text({"stage": "evaluation", "run_id": run_id, "counts": manifest["counts"],
                      "elapsed_seconds": manifest["runtime_seconds"]}), file=sys.stderr)
     return manifest
 
