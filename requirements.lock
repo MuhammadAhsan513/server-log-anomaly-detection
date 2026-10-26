@@ -1,0 +1,18 @@
+# Tested on Python 3.14.4; plotting dependencies are needed only for Phase 2.
+setuptools==78.1.1
+pytest==9.0.2
+iniconfig==2.1.0
+packaging==26.0
+pluggy==1.6.0
+Pygments==2.19.2
+matplotlib==3.10.7
+contourpy==1.4.0
+cycler==0.12.1
+fonttools==4.67.0
+kiwisolver==1.5.1
+numpy==2.3.4
+pillow==13.0.0
+pyparsing==3.3.3
+python-dateutil==3.0.0
+six==1.17.0
+tzdata==2026.5
