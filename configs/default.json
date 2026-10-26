@@ -1,0 +1,91 @@
+{
+  "schema_version": "1.0",
+  "features": {
+    "schema_version": "1.0",
+    "source_timezone": "unspecified",
+    "max_rejected_fraction": 0.05,
+    "window_minutes": 5,
+    "alternate_window_minutes": 15,
+    "split_start_day": null,
+    "train_days": 4,
+    "validation_days": 1,
+    "health_endpoints": [
+      "/health"
+    ],
+    "minimum_records": 20
+  },
+  "rules": {
+    "schema_version": "1.0",
+    "history_hours": 24,
+    "minimum_history_windows": 12,
+    "daypart_hours": 6,
+    "rate_epsilon": 0.01,
+    "latency_epsilon_ms": 1.0,
+    "count_epsilon": 1.0,
+    "minimum_statuses": 20,
+    "http_minimum_errors": 5,
+    "http_error_rate": 0.2,
+    "http_robust_score": 4.0,
+    "minimum_auth_attempts": 10,
+    "auth_minimum_failures": 10,
+    "auth_failure_rate": 0.8,
+    "minimum_latencies": 20,
+    "latency_p95_ms": 1000.0,
+    "latency_multiplier": 3.0,
+    "minimum_records": 20,
+    "error_minimum_count": 5,
+    "error_robust_score": 4.0,
+    "traffic_minimum_count": 30,
+    "traffic_robust_score": 4.0,
+    "traffic_recurrence_days": 7,
+    "traffic_recurrence_minimum_days": 2,
+    "traffic_recurrence_tolerance_minutes": 15,
+    "traffic_recurrence_ratio": 1.25,
+    "health_minimum_failures": 2
+  },
+  "ml": {
+    "schema_version": "1.0",
+    "resolutions": [
+      5,
+      15
+    ],
+    "scopes": [
+      "service",
+      "endpoint",
+      "auth_ip"
+    ],
+    "minimum_records": 20,
+    "minimum_training_windows": 100,
+    "minimum_validation_windows": 20,
+    "n_estimators": 200,
+    "max_samples": 256,
+    "max_features": 1.0,
+    "contamination": "auto",
+    "random_state": 42,
+    "candidate_percentiles": [
+      95.0,
+      97.5,
+      99.0
+    ],
+    "threshold_percentile": 99.0,
+    "stability_seeds": [
+      43,
+      44,
+      45
+    ],
+    "training_filter_percentile": 99.0,
+    "daypart_hours": 6,
+    "top_features": 3
+  },
+  "incidents": {
+    "schema_version": "1.0",
+    "merge_gap_minutes": 5,
+    "sample_evidence_limit": 5,
+    "high_minimum_minutes": 15,
+    "high_http_5xx_rate": 0.5,
+    "high_minimum_statuses": 30,
+    "review_categories": [
+      "traffic"
+    ]
+  }
+}

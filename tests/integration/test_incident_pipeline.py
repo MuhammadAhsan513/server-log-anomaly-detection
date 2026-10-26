@@ -41,6 +41,28 @@ def hashes(tmp_path):
             for d in ("features", "rules", "ml") for p in (tmp_path / d).rglob("*") if p.is_file()}
 
 
+def test_evaluation_cli_reproducible_and_rejects_invalid_labels(runs):
+    assert cli(runs, "incidents-for-evaluation") == 0
+    label_path = runs / "labels.json"
+    label_path.write_text(json.dumps({"schema_version": "1.0", "seed": 7, "events": []}))
+    command = ["evaluate", "--input", str(runs / "incidents-for-evaluation"),
+               "--labels", str(label_path), "--config", str(ROOT / "configs/evaluation.json")]
+    before = hashes(runs)
+    for name in ("evaluation-a", "evaluation-b"):
+        assert main([*command, "--output", str(runs / name)]) == 0
+    first = json.loads((runs / "evaluation-a/evaluation.json").read_text())
+    second = json.loads((runs / "evaluation-b/evaluation.json").read_text())
+    assert first == second
+    assert first["results"]["test"]["rules"]["tp"] == 0
+    assert first["results"]["test"]["rules"]["recall"]["value"] is None
+    assert hashes(runs) == before
+    assert json.loads((runs / "evaluation-a/manifest.json").read_text())["pipeline_complete"] is False
+
+    label_path.write_text(json.dumps({"schema_version": "1.0", "events": [{"event_id": "bad"}]}))
+    assert main([*command, "--output", str(runs / "invalid-evaluation")]) == 2
+    assert not (runs / "invalid-evaluation").exists()
+
+
 def test_phase5_cli_publishes_reproducible_traceable_reports(runs):
     sources = hashes(runs)
     assert cli(runs, "first") == cli(runs, "second") == 0

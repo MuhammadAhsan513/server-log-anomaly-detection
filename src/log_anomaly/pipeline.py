@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import SCHEMA_VERSION, __version__
 from .config import (DetectionConfig, EvaluationConfig, FeatureConfig, IncidentConfig, IngestConfig, InputError,
-                     MLConfig)
+                     MLConfig, RunConfig)
 from .features import build_windows
 from .ingest import Enrichment, IngestionResult, NormalizedLog, read_logs
 from .parse import parse_messages
@@ -149,7 +149,7 @@ def _publish(input_path: Path, config: IngestConfig, output: Path) -> dict:
     artifacts = {}
     for path in sorted(staging.rglob("*")):
         if path.is_file() and path.name != "manifest.json":
-            artifacts[path.relative_to(staging).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+            artifacts[path.relative_to(staging).as_posix()] = _file_hash(path)
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "phase": phase,
@@ -191,6 +191,160 @@ def ingest(input_path: Path, config: IngestConfig, output: Path) -> dict:
 def features(input_path: Path, config: FeatureConfig, output: Path) -> dict:
     """Run ingestion/parsing followed by Phase 2 features and EDA only."""
     return _publish(input_path, config, output)
+
+
+def _file_hash(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _validate_delivery(staging: Path, config: RunConfig) -> None:
+    """Check final exports against signals and source evidence without reloading all features."""
+    from .incidents import incidents_csv, validate_incident_report, validate_signals
+
+    report = json.loads((staging / "incidents.json").read_text(encoding="utf-8"))
+    validate_incident_report(report, config.incidents)
+    if (staging / "incidents.csv").read_bytes() != incidents_csv(report["incidents"]).encode("utf-8"):
+        raise ValueError("incident JSON and CSV content disagree")
+    signals = {}
+    for stage in ("rules", "ml"):
+        with (staging / stage / "signals.jsonl").open(encoding="utf-8") as handle:
+            signals[stage] = [json.loads(line) for line in handle]
+    source = json.loads((staging / "features/manifest.json").read_text(encoding="utf-8"))
+    # Retain only fields needed to resolve evidence, not another copy of messages/features.
+    references = {}
+    with (staging / "features/normalized.jsonl").open(encoding="utf-8") as handle:
+        for line in handle:
+            row = json.loads(line)
+            references[row["record_id"]] = tuple(row[k] for k in ("timestamp", "service", "endpoint", "source_ip"))
+    validate_signals(signals["rules"], signals["ml"], source["split_ranges"], set(references))
+    all_signals = signals["rules"] + signals["ml"]
+    if sorted(s["signal_id"] for s in all_signals) != sorted(
+            sid for incident in report["incidents"] for sid in incident["signal_ids"]):
+        raise ValueError("signals are missing or duplicated in final incidents")
+    signal_map = {s["signal_id"]: s for s in all_signals}
+    for incident in report["incidents"]:
+        expected = {rid for sid in incident["signal_ids"] for rid in signal_map[sid]["evidence_record_ids"]}
+        if set(incident["evidence"]["record_ids"]) != expected:
+            raise ValueError("incident evidence differs from contributing signals")
+    for signal in all_signals:
+        for rid in signal["evidence_record_ids"]:
+            timestamp, service, endpoint, ip = references[rid]
+            entity = endpoint if signal["scope"] == "endpoint" else ip if signal["scope"] == "auth_ip" else service
+            if (not signal["window_start"] <= timestamp < signal["window_end"]
+                    or service != signal["service"] or entity != signal["entity_key"]):
+                raise ValueError("signal evidence lies outside its window or entity")
+    quality = json.loads((staging / "quality.json").read_text(encoding="utf-8"))
+    if (not quality["accounting_complete"] or quality["accepted_count"] != len(references)
+            or quality["parsed_count"] != quality["accepted_count"] + quality["rejected_count"]):
+        raise ValueError("incomplete final source accounting")
+
+
+def run(input_path: Path, config: RunConfig, output: Path) -> dict:
+    """Run existing stages sequentially and publish the whole delivery atomically."""
+    import shutil
+
+    start = time.perf_counter()
+    staging = output.with_name(output.name + ".incomplete")
+    if any(p.name.endswith(".incomplete") for p in (output, *output.parents)):
+        raise InputError("output must not be inside an .incomplete directory")
+    if output.exists() or staging.exists() or output.is_symlink() or staging.is_symlink():
+        raise FileExistsError(f"output or staging path already exists: {output}, {staging}")
+    if not input_path.is_file():
+        raise InputError(f"input file does not exist: {input_path}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging.mkdir()
+    state = {"schema_version": SCHEMA_VERSION, "phase": 7, "stage": "end_to_end",
+             "status": "incomplete", "pipeline_complete": False, "active_stage": "features"}
+    _write_json(staging / "manifest.json", state)
+    _write_json(staging / "config.json", config.to_dict())
+    stages = {}
+
+    def execute(name, operation, *args):
+        state["active_stage"] = name
+        _write_json(staging / "manifest.json", state)
+        stages[name] = operation(*args)
+
+    try:
+        execute("features", features, input_path, config.features, staging / "features")
+        execute("rules", detect, staging / "features", config.rules, staging / "rules")
+        execute("ml", ml, staging / "features", config.ml, staging / "ml", staging / "rules")
+        if not stages["ml"]["counts"]["available_models"]:
+            state["status"] = "partial"
+            raise ValueError("ML unavailable: no supported model; inspect ml/ml_summary.json in staging")
+        execute("reports", report_incidents, staging / "features", config.incidents,
+                staging / "reports", staging / "rules", staging / "ml")
+        state["active_stage"] = "delivery_validation"
+        _write_json(staging / "manifest.json", state)
+        for name in ("incidents.json", "incidents.csv", "summary.md"):
+            shutil.copyfile(staging / "reports" / name, staging / name)
+        for name in ("quality.json", "rejects.jsonl"):
+            shutil.copyfile(staging / "features" / name, staging / name)
+        shutil.copytree(staging / "features/charts", staging / "charts")
+        shutil.copyfile(staging / "reports/charts/incidents.png", staging / "charts/incidents.png")
+        with (staging / "signals.jsonl").open("wb") as target:
+            for name in ("rules", "ml"):
+                with (staging / name / "signals.jsonl").open("rb") as source:
+                    shutil.copyfileobj(source, target)
+        # No labels enter this command. Publish split/coverage and independent detector counts only.
+        (staging / "evaluation").mkdir()
+        ml_summary = json.loads((staging / "ml/ml_summary.json").read_text(encoding="utf-8"))
+        _write_json(staging / "evaluation/comparison.json", {
+            "schema_version": SCHEMA_VERSION, "split_ranges": stages["features"]["split_ranges"],
+            "counts": stages["reports"]["counts"], "ml_available_models": ml_summary["available_models"],
+            "ml_unavailable_models": ml_summary["unavailable_models"],
+            "accuracy_metrics": None, "reason": "No authoritative incident labels supplied; counts are candidates.",
+        })
+        _validate_delivery(staging, config)
+        if _file_hash(input_path) != stages["features"]["input_sha256"]:
+            raise InputError("source file changed during processing; rerun from stable input")
+        # Validate every stage's serialized artifacts before relocating its provenance links.
+        for name, manifest in stages.items():
+            for artifact, digest in manifest["artifacts"].items():
+                if _file_hash(staging / name / artifact) != digest:
+                    raise ValueError(f"{name} artifact hash mismatch: {artifact}")
+            for key in ("source_run", "rules_run", "ml_run"):
+                if manifest.get(key):
+                    relative = Path(manifest[key]["path"]).relative_to(staging.resolve())
+                    manifest[key]["path"] = str(output.resolve() / relative)
+            _write_json(staging / name / "manifest.json", manifest)
+        config_hash = hashlib.sha256(json_text(config.to_dict()).encode()).hexdigest()
+        run_id = hashlib.sha256(json_text([stages["features"]["input_sha256"], config_hash, __version__]).encode()).hexdigest()
+        counts = {**stages["features"]["counts"], **stages["reports"]["counts"],
+                  "windows": stages["rules"]["counts"]["windows"],
+                  "available_models": stages["ml"]["counts"]["available_models"]}
+        paths = sorted(p for p in staging.rglob("*") if p.is_file() and p != staging / "manifest.json")
+        manifest = {
+            "schema_version": SCHEMA_VERSION, "phase": 7, "stage": "end_to_end",
+            "status": "complete", "pipeline_complete": True, "run_id": run_id,
+            "input_path": str(input_path.resolve()), "input_sha256": stages["features"]["input_sha256"],
+            "input_size_bytes": stages["features"]["input_size_bytes"], "config_sha256": config_hash,
+            "software_version": __version__, "python_version": platform.python_version(),
+            "dependencies": {k: v for stage in stages.values() for k, v in stage["dependencies"].items()},
+            "timezone": config.features.source_timezone, "seed": config.ml.random_state,
+            "split_ranges": stages["features"]["split_ranges"], "counts": counts,
+            "stage_run_ids": {k: v["run_id"] for k, v in stages.items()},
+            "artifacts": {p.relative_to(staging).as_posix(): _file_hash(p) for p in paths},
+            "artifact_sizes_bytes": {p.relative_to(staging).as_posix(): p.stat().st_size for p in paths},
+            "runtime_seconds": round(time.perf_counter() - start, 6),
+        }
+        _write_json(staging / "manifest.json", manifest)
+        if output.exists():
+            raise FileExistsError(f"output appeared during processing: {output}")
+        staging.rename(output)
+    except Exception as exc:
+        state["error"] = str(exc)
+        try:
+            _write_json(staging / "manifest.json", state)
+        except OSError:
+            pass  # Disk failure must not replace the original exception.
+        if isinstance(exc, (InputError, OSError, ImportError)):
+            raise
+        raise ValueError(f"{state['active_stage']}: {exc}; diagnostics: {staging}") from exc
+    print(json_text({"stage": "end_to_end", "run_id": run_id, "counts": counts,
+                     "elapsed_seconds": manifest["runtime_seconds"],
+                     "summary": str(output / "summary.md")}), file=sys.stderr)
+    return manifest
 
 
 def _read_feature_run(source: Path) -> tuple:
@@ -310,7 +464,7 @@ def detect(input_path: Path, config: DetectionConfig, output: Path) -> dict:
         "timezone": source["timezone"], "seed": None, "split_ranges": source["split_ranges"],
         "baseline_mode": "frozen_training", "runtime_seconds": round(time.perf_counter() - start, 6),
         "counts": {"windows": len(windows), "signals": len(result.signals), "accepted_count": len(records)},
-        "artifacts": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        "artifacts": {path.name: _file_hash(path)
                       for path in sorted(staging.iterdir()) if path.name != "manifest.json"},
     }
     _write_json(staging / "manifest.json", manifest)
@@ -404,7 +558,7 @@ def ml(input_path: Path, config: MLConfig, output: Path, rules: Path | None = No
         "runtime_seconds": round(time.perf_counter() - start, 6),
         "counts": {"windows": len(windows), "signals": len(result.signals), "accepted_count": len(records),
                    "available_models": result.summary["available_models"]},
-        "artifacts": {path.relative_to(staging).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        "artifacts": {path.relative_to(staging).as_posix(): _file_hash(path)
                       for path in sorted(staging.rglob("*")) if path.is_file() and path.name != "manifest.json"},
     }
     _write_json(staging / "manifest.json", manifest)
@@ -481,7 +635,7 @@ def report_incidents(input_path: Path, config: IncidentConfig, output: Path, rul
         "dependencies": {"matplotlib": version("matplotlib")},
         "timezone": source["timezone"], "seed": None, "split_ranges": source["split_ranges"],
         "runtime_seconds": round(time.perf_counter() - start, 6), "counts": counts,
-        "artifacts": {path.relative_to(staging).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        "artifacts": {path.relative_to(staging).as_posix(): _file_hash(path)
                       for path in sorted(staging.rglob("*")) if path.is_file() and path.name != "manifest.json"},
     }
     _write_json(staging / "manifest.json", manifest)
@@ -595,7 +749,7 @@ def evaluate(input_path: Path, config: EvaluationConfig, output: Path, labels_pa
         "timezone": source["timezone"], "seed": labels.get("seed"), "split_ranges": source["split_ranges"],
         "runtime_seconds": round(time.perf_counter() - start, 6),
         "counts": {mode: {k: primary[mode][k] for k in ("expected", "predicted", "tp", "fp", "fn")} for mode in modes},
-        "artifacts": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        "artifacts": {path.name: _file_hash(path)
                       for path in sorted(staging.iterdir()) if path.name != "manifest.json"},
     }
     _write_json(staging / "manifest.json", manifest)

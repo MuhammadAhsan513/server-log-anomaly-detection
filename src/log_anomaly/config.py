@@ -285,17 +285,48 @@ def _unique_keys(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
-def load_config(path: Path, config_type: type[IngestConfig] | type[DetectionConfig] | type[MLConfig]
-                | type[IncidentConfig] | type[EvaluationConfig] = IngestConfig
-                ) -> IngestConfig | DetectionConfig | MLConfig | IncidentConfig | EvaluationConfig:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_keys)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise InputError(f"cannot read configuration: {exc}") from exc
+@dataclass(frozen=True)
+class RunConfig:
+    """Resolved stage configurations; both detectors are required for delivery."""
+
+    schema_version: str
+    features: FeatureConfig
+    rules: DetectionConfig
+    ml: MLConfig
+    incidents: IncidentConfig
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SCHEMA_VERSION:
+            raise InputError("unsupported schema_version")
+        for name, kind in (("features", FeatureConfig), ("rules", DetectionConfig),
+                           ("ml", MLConfig), ("incidents", IncidentConfig)):
+            value = getattr(self, name)
+            if not isinstance(value, kind):
+                object.__setattr__(self, name, _config_from_dict(value, kind))
+
+    def to_dict(self) -> dict:
+        return {"schema_version": self.schema_version,
+                **{name: getattr(self, name).to_dict() for name in ("features", "rules", "ml", "incidents")}}
+
+
+def _config_from_dict(data: object, config_type: type):
     if not isinstance(data, dict):
         raise InputError("configuration must be an object")
     expected = set(config_type.__dataclass_fields__)
     if set(data) != expected:
         raise InputError(f"configuration keys: missing={sorted(expected - set(data))}, "
                          f"unknown={sorted(set(data) - expected)}")
-    return config_type(**data)
+    try:
+        return config_type(**data)
+    except (TypeError, ValueError) as exc:
+        raise InputError(f"invalid {config_type.__name__}: {exc}") from exc
+
+
+def load_config(path: Path, config_type: type[IngestConfig] | type[DetectionConfig] | type[MLConfig]
+                | type[IncidentConfig] | type[EvaluationConfig] | type[RunConfig] = IngestConfig
+                ) -> IngestConfig | DetectionConfig | MLConfig | IncidentConfig | EvaluationConfig | RunConfig:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_keys)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise InputError(f"cannot read configuration: {exc}") from exc
+    return _config_from_dict(data, config_type)

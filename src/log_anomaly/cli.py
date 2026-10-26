@@ -1,19 +1,20 @@
-"""Stage-specific CLI orchestration through Phase 6 labelled-fixture evaluation."""
+"""End-to-end pipeline and compatible individual stage commands."""
 
 import argparse
 import sys
 from pathlib import Path
 
 from .config import (DetectionConfig, EvaluationConfig, FeatureConfig, IncidentConfig, IngestConfig, InputError,
-                     MLConfig, load_config)
-from .pipeline import detect, evaluate, features, ingest, json_text, ml, report_incidents
+                     MLConfig, RunConfig, load_config)
+from .pipeline import detect, evaluate, features, ingest, json_text, ml, report_incidents, run
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Log anomaly project — ingestion, features, rule/ML detection, "
                                                  "incidents, labelled evaluation")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name, description in (("ingest", "validate and parse logs"),
+    for name, description in (("run", "complete raw CSV to rule/ML incident reports (both detectors required)"),
+                              ("ingest", "validate and parse logs"),
                               ("features", "ingest, aggregate, split, and chart logs; no detection"),
                               ("detect", "score rules from a completed Phase 2 artifact directory"),
                               ("ml", "fit/score Isolation Forest from a completed Phase 2 artifact directory"),
@@ -33,7 +34,8 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--labels", type=Path, required=True, help="evaluator-only fixture labels JSON")
     args = parser.parse_args(argv)
     try:
-        config_type, operation = {"ingest": (IngestConfig, ingest), "features": (FeatureConfig, features),
+        config_type, operation = {"run": (RunConfig, run),
+                                  "ingest": (IngestConfig, ingest), "features": (FeatureConfig, features),
                                   "detect": (DetectionConfig, detect), "ml": (MLConfig, ml),
                                   "incidents": (IncidentConfig, report_incidents),
                                   "evaluate": (EvaluationConfig, evaluate)}[args.command]
