@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from log_anomaly.config import FeatureConfig, IngestConfig, InputError, load_config
+from log_anomaly.config import DetectionConfig, FeatureConfig, IngestConfig, InputError, load_config
 
 
 @pytest.mark.parametrize("value", [-0.1, 1.1, True, "0.05", None, float("nan"), float("inf")])
@@ -52,3 +52,18 @@ def test_stage_configs_remain_separate():
         load_config(Path("configs/features.json"))
     with pytest.raises(InputError):
         load_config(Path("configs/ingest.json"), FeatureConfig)
+    assert load_config(Path("configs/detection.json"), DetectionConfig) == DetectionConfig()
+    with pytest.raises(InputError):
+        load_config(Path("configs/features.json"), DetectionConfig)
+
+
+@pytest.mark.parametrize("change", [
+    {"history_hours": 0}, {"history_hours": 10000}, {"minimum_history_windows": True},
+    {"minimum_statuses": 1.5}, {"daypart_hours": 5}, {"rate_epsilon": 0},
+    {"latency_epsilon_ms": float("nan")}, {"count_epsilon": float("inf")},
+    {"http_error_rate": 1.1}, {"auth_failure_rate": -1}, {"latency_multiplier": "3"},
+    {"error_robust_score": False}, {"schema_version": "2"},
+])
+def test_detection_configuration_rejects_invalid_values(change):
+    with pytest.raises(InputError):
+        DetectionConfig(**change)

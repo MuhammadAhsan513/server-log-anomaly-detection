@@ -6,3 +6,15 @@ __pycache__/
 build/
 dist/
 artifacts/
+
+# Generated data and outputs
+artifacts/
+logs/
+docs/
+examples/reports/
+
+ docs/
+ examples/
+ logs/
+ task.docx
+ tests/fixtures/

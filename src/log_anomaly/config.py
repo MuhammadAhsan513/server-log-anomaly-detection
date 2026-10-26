@@ -75,6 +75,61 @@ class FeatureConfig(IngestConfig):
         return {**asdict(self), "health_endpoints": list(self.health_endpoints)}
 
 
+@dataclass(frozen=True)
+class DetectionConfig:
+    schema_version: str = SCHEMA_VERSION
+    history_hours: int = 24
+    minimum_history_windows: int = 12
+    daypart_hours: int = 6
+    rate_epsilon: float = 0.01
+    latency_epsilon_ms: float = 1.0
+    count_epsilon: float = 1.0
+    minimum_statuses: int = 20
+    http_minimum_errors: int = 5
+    http_error_rate: float = 0.20
+    http_robust_score: float = 4.0
+    minimum_auth_attempts: int = 10
+    auth_minimum_failures: int = 10
+    auth_failure_rate: float = 0.80
+    minimum_latencies: int = 20
+    latency_p95_ms: float = 1000.0
+    latency_multiplier: float = 3.0
+    minimum_records: int = 20
+    error_minimum_count: int = 5
+    error_robust_score: float = 4.0
+    traffic_minimum_count: int = 30
+    traffic_robust_score: float = 4.0
+    health_minimum_failures: int = 2
+
+    def __post_init__(self) -> None:
+        if self.schema_version != SCHEMA_VERSION:
+            raise InputError("unsupported schema_version")
+        integer_keys = {
+            "history_hours", "minimum_history_windows", "daypart_hours", "minimum_statuses",
+            "http_minimum_errors", "minimum_auth_attempts", "auth_minimum_failures",
+            "minimum_latencies", "minimum_records", "error_minimum_count",
+            "traffic_minimum_count", "health_minimum_failures",
+        }
+        for key, value in asdict(self).items():
+            if key == "schema_version":
+                continue
+            if key in integer_keys:
+                if type(value) is not int or value <= 0:
+                    raise InputError(f"{key} must be a positive integer")
+            elif (isinstance(value, bool) or not isinstance(value, (float, int))
+                  or not math.isfinite(value) or value <= 0):
+                raise InputError(f"{key} must be finite and positive")
+        if self.daypart_hours > 24 or 24 % self.daypart_hours:
+            raise InputError("daypart_hours must divide 24")
+        if self.history_hours > 24 * 365:
+            raise InputError("history_hours must not exceed one year")
+        if any(getattr(self, key) > 1 for key in ("http_error_rate", "auth_failure_rate", "rate_epsilon")):
+            raise InputError("rates must be in (0, 1]")
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
 def _unique_keys(pairs: list[tuple[str, object]]) -> dict:
     result = {}
     for key, value in pairs:
@@ -84,7 +139,8 @@ def _unique_keys(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
-def load_config(path: Path, config_type: type[IngestConfig] = IngestConfig) -> IngestConfig:
+def load_config(path: Path, config_type: type[IngestConfig] | type[DetectionConfig] = IngestConfig
+                ) -> IngestConfig | DetectionConfig:
     try:
         data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_keys)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:

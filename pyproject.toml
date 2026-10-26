@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "log-anomaly"
-version = "0.2.0"
-description = "Traceable log ingestion, window features, and exploratory analysis"
+version = "0.3.1"
+description = "Traceable log features, rule-based anomaly detection, and historical baselines"
 requires-python = ">=3.11"
 dependencies = []
 

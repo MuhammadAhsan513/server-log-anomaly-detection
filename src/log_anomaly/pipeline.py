@@ -7,13 +7,14 @@ import sys
 import time
 from collections import Counter
 from dataclasses import asdict
+from datetime import datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path
 
 from . import SCHEMA_VERSION, __version__
-from .config import FeatureConfig, IngestConfig, InputError
+from .config import DetectionConfig, FeatureConfig, IngestConfig, InputError
 from .features import build_windows
-from .ingest import IngestionResult, read_logs
+from .ingest import Enrichment, IngestionResult, NormalizedLog, read_logs
 from .parse import parse_messages
 
 
@@ -189,3 +190,132 @@ def ingest(input_path: Path, config: IngestConfig, output: Path) -> dict:
 def features(input_path: Path, config: FeatureConfig, output: Path) -> dict:
     """Run ingestion/parsing followed by Phase 2 features and EDA only."""
     return _publish(input_path, config, output)
+
+
+def _read_feature_run(source: Path) -> tuple:
+    """Read/hash the exact consumed bytes; refuse partial or incompatible stages."""
+    try:
+        if source.name.endswith(".incomplete"):
+            raise InputError("cannot detect from an incomplete directory")
+        manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
+        if (manifest["schema_version"] != SCHEMA_VERSION or manifest["phase"] != 2
+                or manifest["status"] != "complete" or manifest["stage"] != "eda_and_features"):
+            raise InputError("detection requires a completed Phase 2 feature run")
+
+        def rows(name):
+            digest = hashlib.sha256()
+            with (source / name).open("rb") as handle:
+                for line in handle:
+                    digest.update(line)
+                    yield json.loads(line)
+            if digest.hexdigest() != manifest["artifacts"][name]:
+                raise InputError(f"feature artifact hash mismatch: {name}")
+
+        configs = list(rows("config.json"))
+        feature_config = FeatureConfig(**configs[0])
+        if len(configs) != 1 or hashlib.sha256(json_text(feature_config.to_dict()).encode()).hexdigest() != manifest["config_sha256"]:
+            raise InputError("feature configuration mismatch")
+        ranges = manifest["split_ranges"]
+        previous = None
+        for split in ("train", "validation", "test"):
+            bounds = ranges[split]
+            start, end = (datetime.fromisoformat(bounds[k]) for k in ("start", "end"))
+            if (start.tzinfo or end.tzinfo or start >= end or start.time().isoformat() != "00:00:00"
+                    or end.time().isoformat() != "00:00:00" or (previous and previous != start)):
+                raise InputError("invalid chronological split ranges")
+            previous = end
+        windows = list(rows("windows.jsonl"))
+        seen = set()
+        totals = Counter()
+        for window in windows:
+            bounds = ranges[window["split"]]
+            start, end = (datetime.fromisoformat(window[k]) for k in ("window_start", "window_end"))
+            minutes = window["window_minutes"]
+            if (window["feature_schema_version"] != SCHEMA_VERSION or minutes not in (5, 15)
+                    or window["scope"] not in {"service", "endpoint", "auth_ip"}
+                    or not bounds["start"] <= window["window_start"] < window["window_end"] <= bounds["end"]
+                    or start.tzinfo or end.tzinfo or start.minute % minutes or start.second or start.microsecond
+                    or end - start != timedelta(minutes=minutes)):
+                raise InputError("invalid feature window or split boundary")
+            key = (minutes, window["window_start"], window["service"], window["scope"], window["entity_key"])
+            if key in seen:
+                raise InputError("duplicate feature window")
+            seen.add(key)
+            if window["record_count"] != window["business"]["record_count"] + window["health"]["record_count"]:
+                raise InputError("feature health/business counts mismatch")
+            if window["scope"] == "service":
+                totals[minutes] += window["record_count"]
+        records = []
+        ids = set()
+        for row in rows("normalized.jsonl"):
+            if (row["schema_version"] != SCHEMA_VERSION or row["record_id"] in ids
+                    or row["record_id"] != f'{manifest["input_sha256"]}:{row["source_record_number"]}'):
+                raise InputError("invalid normalized source reference")
+            ids.add(row["record_id"])
+            row["timestamp"] = datetime.fromisoformat(row["timestamp"])
+            if not ranges["train"]["start"] <= row["timestamp"].isoformat() < ranges["test"]["end"]:
+                raise InputError("normalized event outside feature splits")
+            row["enrichment"] = Enrichment(**row["enrichment"])
+            # Raw messages remain in the source run; only the evidence resolver needs them here.
+            row["original_fields"] = {}
+            records.append(NormalizedLog(**row))
+        if not records or len(records) != manifest["counts"]["accepted_count"] or any(
+                totals[m] != len(records) for m in (5, 15)):
+            raise InputError("feature/normalized record accounting mismatch")
+        return manifest, feature_config, windows, records
+    except InputError:
+        raise
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError, IndexError) as exc:
+        raise InputError(f"cannot read Phase 2 artifacts: {exc}") from exc
+
+
+def detect(input_path: Path, config: DetectionConfig, output: Path) -> dict:
+    """Publish only Phase 3 artifacts, retaining hashes/links to the feature run."""
+    from .rules import detect_rules
+
+    start = time.perf_counter()
+    staging = output.with_name(output.name + ".incomplete")
+    if output.exists() or staging.exists():
+        raise FileExistsError(f"output or staging path already exists: {output}, {staging}")
+    source, feature_config, windows, records = _read_feature_run(input_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging.mkdir()
+    _write_json(staging / "manifest.json", {
+        "schema_version": SCHEMA_VERSION, "phase": 3, "status": "incomplete", "pipeline_complete": False,
+    })
+    result = detect_rules(windows, records, source["split_ranges"], feature_config.health_endpoints, config)
+    _write_json(staging / "config.json", config.to_dict())
+    _write_json(staging / "baselines.json", result.baselines)
+    _write_json(staging / "detection_summary.json", result.diagnostics)
+    _write_lines(staging / "signals.jsonl", result.signals)
+    # Read-back validation must precede publication, including the no-signal case.
+    with (staging / "signals.jsonl").open(encoding="utf-8") as handle:
+        serialized = [json.loads(line) for line in handle]
+    if serialized != result.signals or len({s["signal_id"] for s in serialized}) != len(serialized):
+        raise ValueError("serialized signals mismatch or duplicate identity")
+    for name, expected in (("baselines.json", result.baselines),
+                           ("detection_summary.json", result.diagnostics), ("config.json", config.to_dict())):
+        if json.loads((staging / name).read_text(encoding="utf-8")) != expected:
+            raise ValueError(f"serialized detection artifact mismatch: {name}")
+    config_hash = hashlib.sha256(json_text(config.to_dict()).encode()).hexdigest()
+    source_hashes = {name: source["artifacts"][name] for name in ("config.json", "windows.jsonl", "normalized.jsonl")}
+    run_id = hashlib.sha256(json_text([source_hashes, source["split_ranges"], config_hash, __version__]).encode()).hexdigest()
+    manifest = {
+        "schema_version": SCHEMA_VERSION, "phase": 3, "stage": "rules_and_baselines",
+        "status": "complete", "pipeline_complete": False, "run_id": run_id,
+        "source_run": {"path": str(input_path.resolve()), "run_id": source["run_id"], "artifacts": source_hashes},
+        "input_sha256": source["input_sha256"], "config_sha256": config_hash,
+        "software_version": __version__, "python_version": platform.python_version(), "dependencies": {},
+        "timezone": source["timezone"], "seed": None, "split_ranges": source["split_ranges"],
+        "baseline_mode": "frozen_training", "runtime_seconds": round(time.perf_counter() - start, 6),
+        "counts": {"windows": len(windows), "signals": len(result.signals), "accepted_count": len(records)},
+        "artifacts": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                      for path in sorted(staging.iterdir()) if path.name != "manifest.json"},
+    }
+    _write_json(staging / "manifest.json", manifest)
+    if output.exists():
+        raise FileExistsError(f"output appeared during processing: {output}")
+    staging.rename(output)
+    print(json_text({"stage": manifest["stage"], "run_id": run_id, "counts": manifest["counts"],
+                     "elapsed_seconds": manifest["runtime_seconds"]}), file=sys.stderr)
+    return manifest
