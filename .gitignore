@@ -5,16 +5,16 @@ __pycache__/
 .pytest_cache/
 build/
 dist/
-artifacts/
-
-# Generated data and outputs
+# Private input, planning material, and generated outputs
 artifacts/
 logs/
 docs/
 examples/reports/
+task.docx
 
- docs/
- examples/
- logs/
- task.docx
- tests/fixtures/
+# Local agent configuration and credentials
+.agents/
+.codex/
+.aws/
+.env
+.env.*

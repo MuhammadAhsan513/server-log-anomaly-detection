@@ -257,16 +257,24 @@ To measure your machine, choose a fresh output path:
 /usr/bin/time -v python -m log_anomaly run --input logs/server_application_logs_100k.csv --config configs/default.json --output artifacts/benchmark-run
 ```
 
-A clean virtual environment and a repository copy excluding `docs/`, original
-logs, existing artifacts, and the working environment were used to verify the
-install, CLI, test suite, generator, and one-command demonstration. The full
-local suite passed **194 tests**. The clean-copy suite passed **193**, with the
+The final submission audit used a new Python 3.14.4 virtual environment and a
+copy containing only Git-tracked submission files, excluding `docs/`, original
+logs, existing artifacts, and the working environment. All locked dependencies
+installed from locally cached wheels; installation, CLI help, tests, generation,
+and the one-command demonstration passed. The full local suite passed **195
+tests**. The clean-copy suite passed **194**, with the
 private-source integration test intentionally skipped because its CSV was
 absent; the full-source benchmark above covers that input separately. The CI
 workflow in `.github/workflows/ci.yml` runs locked installation, CLI help, all
 tests, a development-seed evaluation, and the full pipeline on generated input.
 Hosted CI must run after publication; local verification does not claim a
 GitHub Actions run.
+
+The audit fixed the first-evidence timestamp for out-of-order CSV records and
+added a regression test. All 42 saved full-run artifact hashes and all 100,000
+original record references were verified. The fresh seed-11 demonstration's
+incident JSON matched the saved evaluation report exactly; detector settings
+and the reported Phase 6 metrics are unchanged.
 
 Requirement evidence available in the repository:
 

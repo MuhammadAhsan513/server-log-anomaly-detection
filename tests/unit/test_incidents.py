@@ -77,6 +77,16 @@ def test_burst_merges_resolutions_and_deduplicates_evidence():
     assert any("each source record is counted once" in text for text in incident["limitations"])
 
 
+def test_evidence_bounds_use_event_time_for_out_of_order_source():
+    # Ingestion sorts events but retains their original CSV ordinals.
+    rows = sorted([record(1, "12:04:00"), record(2, "12:01:00"), record(3, "12:03:00")],
+                  key=lambda r: r.timestamp)
+    [incident] = group_incidents([signal("burst", "12:00:00", [2, 3, 1])], [], rows, CONFIG)
+    assert incident["evidence"]["record_ids"] == ["h:1", "h:2", "h:3"]
+    assert (incident["first_evidence_time"], incident["last_evidence_time"]) == (
+        "2025-02-05T12:01:00", "2025-02-05T12:04:00")
+
+
 def test_gap_scope_entity_and_split_boundaries():
     rows = records(12) + [record(20, "12:00:10", service="auth-service", ip="192.0.2.8"),
                           record(21, "12:00:20", service="auth-service", ip="192.0.2.9")]

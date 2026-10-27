@@ -339,7 +339,7 @@ def _incident(key: tuple, group: dict, records: dict, config: IncidentConfig) ->
     return {
         "incident_id": f"inc-{digest[:20]}", "split": split,
         "start_time": start.isoformat(), "end_time": end.isoformat(),
-        "first_evidence_time": rows[0].timestamp.isoformat() if rows else None,
+        "first_evidence_time": min(r.timestamp for r in rows).isoformat() if rows else None,
         "last_evidence_time": max(r.timestamp for r in rows).isoformat() if rows else None,
         "services": [service], "category": category,
         "entity": {"scope": scope, "endpoint": entity_key if scope == "endpoint" else None,
