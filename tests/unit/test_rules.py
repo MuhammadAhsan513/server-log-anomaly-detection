@@ -297,3 +297,16 @@ def test_recurring_daily_volume_is_suppressed_but_new_surges_are_not(csv_file, r
     # Training days without enough prior days keep alerting, with the limitation stated.
     first_day = [s for s in for_detector(result, "traffic_surge") if s["window_start"] == "2025-02-03T03:00:00"]
     assert first_day and any("recurrence context unavailable" in t for t in first_day[0]["limitations"])
+    # Inference reuses both frozen references and saved recurrence counts; no new training windows.
+    from log_anomaly.baselines import Recurrence
+    recurrence = Recurrence(CONFIG)
+    for window in features.windows:
+        if window['split'] == 'train':
+            recurrence.add(window)
+    frozen_before = deepcopy(result.baselines)
+    counts_before = deepcopy(recurrence.counts)
+    inferred = detect_rules([w for w in features.windows if w['split'] == 'test'], records,
+                            features.split_ranges, features_config.health_endpoints, CONFIG,
+                            frozen_baselines=result.baselines, recurrence=recurrence)
+    assert inferred.signals == [s for s in result.signals if s['split'] == 'test']
+    assert result.baselines == frozen_before and recurrence.counts == counts_before

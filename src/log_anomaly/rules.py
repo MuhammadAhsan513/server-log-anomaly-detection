@@ -99,17 +99,22 @@ class Evidence:
 
 
 def detect_rules(windows: list[dict], records: list[NormalizedLog], split_ranges: dict,
-                 health_endpoints: tuple[str, ...], config: DetectionConfig) -> DetectionResult:
+                 health_endpoints: tuple[str, ...], config: DetectionConfig, *,
+                 frozen_baselines: dict | None = None,
+                 recurrence: Recurrence | None = None) -> DetectionResult:
     """Score training causally, then validation/test against frozen training only.
 
     Both resolutions run independently. Overlap is retained for Phase 5 grouping.
     Thresholds are explicit configuration, never selected from held-out values.
     """
-    baselines = fit_baselines(windows, split_ranges["train"], config)
+    if frozen_baselines is not None and any(w["split"] == "train" for w in windows):
+        raise ValueError("frozen inference cannot update training history")
+    baselines = (frozen_baselines if frozen_baselines is not None
+                 else fit_baselines(windows, split_ranges["train"], config))
     frozen = {series_key(r) + (r["metric"], r["daypart"]): r for r in baselines["references"]}
     history = History(config)
     empty_history = History(config)
-    volumes = Recurrence(config)
+    volumes = recurrence if recurrence is not None else Recurrence(config)
     evidence = Evidence(records, health_endpoints)
     signals = []
     counts = Counter()

@@ -179,7 +179,7 @@ def _daypart(window: dict, config: MLConfig) -> int:
 
 def fit_and_score(windows: list[dict], records: list[NormalizedLog], split_ranges: dict,
                   health_endpoints: tuple[str, ...], config: MLConfig,
-                  rule_signals: list[dict] | None = None) -> MLResult:
+                  rule_signals: list[dict] | None = None, *, training_only: bool = False) -> MLResult:
     """Fit one model per resolution, scope and known service from supported training windows.
 
     Preprocessing and trees see training windows only. Thresholds come from
@@ -188,6 +188,8 @@ def fit_and_score(windows: list[dict], records: list[NormalizedLog], split_range
     """
     groups = defaultdict(lambda: {split: [] for split in ("train", *HELD_OUT)})
     for window in sorted(windows, key=lambda w: (w["window_start"], w["service"], w["entity_key"])):
+        if training_only and window["split"] == "test":
+            continue
         if window["window_minutes"] in config.resolutions and window["scope"] in config.scopes:
             groups[(window["window_minutes"], window["scope"], window["service"])][window["split"]].append(window)
     evidence = Evidence(records, health_endpoints)
@@ -242,6 +244,10 @@ def fit_and_score(windows: list[dict], records: list[NormalizedLog], split_range
                        "training_window_count": len(train), "max_samples_used": min(config.max_samples, len(train)),
                        "preprocessing": preprocessing, "threshold": selected}
         entry.update(status="available", calibration={"candidates": candidates, "selected": selected})
+
+        if training_only:
+            # Sensitivity fits and held-out signal reports do not affect the saved estimator.
+            continue
 
         # Sensitivity experiments use training and validation only, never test.
         stability = []
@@ -370,16 +376,66 @@ def _signal(window: dict, score: float, selected: dict, preprocessing: dict, key
 def score_windows(metadata: dict, estimators: dict, windows: list[dict]) -> list[dict]:
     """Score unseen windows with a frozen bundle; missing models are reported, never substituted."""
     config = MLConfig(**metadata["config"])
-    results = []
-    for window in windows:
+    results = [None] * len(windows)
+    groups = defaultdict(list)
+    for index, window in enumerate(windows):
         key = model_key(window["window_minutes"], window["scope"], window["service"])
-        model = metadata["models"].get(key)
-        if model is None or key not in estimators:
-            results.append({"model_key": key, "status": "ml_unavailable", "score": None, "alert": None})
-        elif not _supported(window, config):
-            results.append({"model_key": key, "status": "low_support", "score": None, "alert": None})
+        reason = ("incomplete_window" if window.get("incomplete_window") else
+                  "ml_unavailable" if key not in metadata["models"] or key not in estimators else
+                  "low_support" if not _supported(window, config) else None)
+        if reason:
+            results[index] = {"model_key": key, "status": reason, "score": None, "alert": None}
         else:
-            score = float(anomaly_scores(estimators[key], transform([window], model["preprocessing"]))[0])
-            results.append({"model_key": key, "status": "scored", "score": score,
-                            "alert": score > model["threshold"]["threshold"]})
+            groups[key].append(index)
+    for key, indices in groups.items():
+        model = metadata["models"][key]
+        scores = anomaly_scores(estimators[key], transform([windows[i] for i in indices], model["preprocessing"]))
+        for index, score in zip(indices, scores):
+            results[index] = {"model_key": key, "status": "scored", "score": float(score),
+                              "alert": bool(score > model["threshold"]["threshold"])}
     return results
+
+
+def validate_model_schema(metadata: dict, estimators: dict) -> None:
+    """Reject incompatible feature definitions before scoring trusted estimators."""
+    from .config import InputError
+    from sklearn.utils.validation import check_is_fitted
+
+    try:
+        if (metadata["bundle_version"] != BUNDLE_VERSION or metadata["schema_version"] != "1.0"
+                or metadata["detector_version"] != DETECTOR_VERSION
+                or metadata["detector_id"] != DETECTOR_ID):
+            raise ValueError("unsupported model schema/version")
+        config = MLConfig(**metadata["config"])
+        for key, entry in metadata["models"].items():
+            if (key != model_key(entry["window_minutes"], entry["scope"], entry["service"])
+                    or entry["scope"] not in config.scopes or entry["window_minutes"] not in config.resolutions):
+                raise ValueError("incompatible model identity")
+            prep = entry["preprocessing"]
+            allowed = []
+            for path, log in FEATURES[entry["scope"]]:
+                for kind in ("value", "missing"):
+                    allowed.append({"name": ".".join(path) + ("__missing" if kind == "missing" else ""),
+                                    "path": list(path), "log1p": log, "kind": kind})
+            positions = [allowed.index(f) for f in prep["features"]]
+            if not positions or positions != sorted(set(positions)):
+                raise ValueError("incompatible feature order")
+            for feature in prep["features"]:
+                base = feature["name"].removesuffix("__missing")
+                for field in ("medians", "raw_medians", "scales"):
+                    if not math.isfinite(prep[field][base]):
+                        raise ValueError("invalid preprocessing statistic")
+                if prep["scales"][base] <= 0:
+                    raise ValueError("invalid preprocessing scale")
+            threshold = entry["threshold"]
+            if (not math.isfinite(threshold["threshold"])
+                    or threshold["percentile"] != config.threshold_percentile):
+                raise ValueError("invalid calibrated threshold")
+            estimator = estimators[key]
+            if not isinstance(estimator, IsolationForest):
+                raise ValueError("unexpected estimator type")
+            check_is_fitted(estimator)
+            if estimator.n_features_in_ != len(positions):
+                raise ValueError("estimator feature count mismatch")
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise InputError(f"incompatible model bundle: {exc}") from exc

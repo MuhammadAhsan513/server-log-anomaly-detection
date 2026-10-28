@@ -2,8 +2,8 @@
 
 import csv
 import hashlib
-import io
 import ipaddress
+import json
 import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -24,7 +24,7 @@ TIMESTAMP_PATTERN = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0
 INTEGER_PATTERN = re.compile(r"[0-9]+")
 
 
-@dataclass
+@dataclass(slots=True)
 class Enrichment:
     method: str | None = None
     upstream_service: str | None = None
@@ -41,7 +41,7 @@ class Enrichment:
     message_template: str | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class NormalizedLog:
     record_id: str
     source_record_number: int
@@ -142,24 +142,31 @@ def _normalize(raw: dict[str, str], ordinal: int, digest: str) -> tuple[Normaliz
     ), []
 
 
-def read_logs(path: Path) -> IngestionResult:
-    """Read one immutable byte snapshot; retain duplicates and quarantine row errors.
+def read_logs(path: Path, *, record_sink=None) -> IngestionResult:
+    """Stream and verify an immutable input; retain duplicates and quarantine errors.
 
     Accept a single UTF-8 BOM at file start. Fatal framing/encoding errors never
     return a result that could be mistaken for complete record accounting.
+    A record_sink receives each accepted row instead of retaining records/rejects;
+    quality accounting remains complete for the temporary-storage training path.
     """
     try:
-        content = path.read_bytes()
-        text = content.decode("utf-8-sig")
+        with path.open("rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+            size = handle.tell()
+        handle = path.open(encoding="utf-8-sig", newline="")
     except (OSError, UnicodeError) as exc:
         raise InputError(f"cannot read UTF-8 input {path}: {exc}") from exc
-    digest = hashlib.sha256(content).hexdigest()
-    reader = csv.reader(io.StringIO(text, newline=""), strict=True)
+    reader = csv.reader(handle, strict=True)
     records: list[NormalizedLog] = []
     rejects: list[RejectedLog] = []
     seen = set()
     duplicate_candidates = 0
     parsed = 0
+    order = []
+    flags = Counter()
+    rejection_reasons = Counter()
+    rejected = 0
     try:
         columns = next(reader, None)
         if not columns:
@@ -172,40 +179,55 @@ def read_logs(path: Path) -> IngestionResult:
         for ordinal, values in enumerate(reader, start=1):
             parsed += 1
             if len(values) != len(columns):
-                rejects.append(RejectedLog(f"{digest}:{ordinal}", ordinal,
-                                           ["column_count"], values))
-                continue
-            raw = dict(zip(columns, values))
-            record, reasons = _normalize(raw, ordinal, digest)
+                record, reasons = None, ["column_count"]
+            else:
+                record, reasons = _normalize(dict(zip(columns, values)), ordinal, digest)
             if record is None:
-                rejects.append(RejectedLog(f"{digest}:{ordinal}", ordinal, reasons, values))
+                rejected += 1
+                rejection_reasons.update(reasons)
+                if record_sink is None:
+                    rejects.append(RejectedLog(f"{digest}:{ordinal}", ordinal, reasons, values))
                 continue
-            key = tuple(values)
+            # Keep fixed-size fingerprints instead of retaining another copy of every CSV row.
+            key = hashlib.sha256(json.dumps(values, ensure_ascii=False).encode()).digest()
             if key in seen:
                 duplicate_candidates += 1
             seen.add(key)
-            records.append(record)
+            order.append((record.timestamp, ordinal))
+            flags.update(record.quality_flags)
+            if record_sink is None:
+                records.append(record)
+            else:
+                record_sink(record)
     except csv.Error as exc:
         raise InputError(f"CSV framing error near physical line {reader.line_num}, "
                          f"data record {parsed + 1}; accounting incomplete: {exc}") from exc
-    original_order = [r.source_record_number for r in records]
+    except UnicodeError as exc:
+        raise InputError(f"cannot read UTF-8 input {path}: {exc}") from exc
+    finally:
+        handle.close()
+    with path.open("rb") as handle:
+        if hashlib.file_digest(handle, "sha256").hexdigest() != digest:
+            raise InputError("source file changed during ingestion")
+    original_order = [ordinal for _, ordinal in order]
+    order.sort()
     records.sort(key=lambda r: (r.timestamp, r.source_record_number))
     quality = {
         "schema_version": SCHEMA_VERSION,
         "input_sha256": digest,
         "parsed_count": parsed,
-        "accepted_count": len(records),
-        "rejected_count": len(rejects),
-        "rejected_fraction": len(rejects) / parsed if parsed else 0.0,
+        "accepted_count": len(order),
+        "rejected_count": rejected,
+        "rejected_fraction": rejected / parsed if parsed else 0.0,
         "accounting_complete": True,
-        "rejection_reasons": dict(sorted(Counter(reason for r in rejects for reason in r.reasons).items())),
-        "field_quality_counts": dict(sorted(Counter(flag for r in records for flag in r.quality_flags).items())),
+        "rejection_reasons": dict(sorted(rejection_reasons.items())),
+        "field_quality_counts": dict(sorted(flags.items())),
         "duplicate_candidates": duplicate_candidates,
-        "ordering_changes": sum(a != b.source_record_number for a, b in zip(original_order, records)),
+        "ordering_changes": sum(a != b for a, (_, b) in zip(original_order, order)),
         "source_time_bounds": {
-            "first": records[0].timestamp.isoformat() if records else None,
-            "last": records[-1].timestamp.isoformat() if records else None,
+            "first": order[0][0].isoformat() if order else None,
+            "last": order[-1][0].isoformat() if order else None,
         },
         "parse_coverage": {},
     }
-    return IngestionResult(digest, len(content), columns, records, rejects, quality)
+    return IngestionResult(digest, size, columns, records, rejects, quality)

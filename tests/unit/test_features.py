@@ -3,7 +3,7 @@ from dataclasses import replace
 import pytest
 
 from log_anomaly.config import FeatureConfig, InputError
-from log_anomaly.features import build_windows
+from log_anomaly.features import build_windows, build_training_windows
 from log_anomaly.ingest import read_logs
 from log_anomaly.parse import parse_messages
 
@@ -39,7 +39,11 @@ def test_hand_computed_statistics_health_empty_and_boundaries(csv_file, row):
         {**row, "timestamp": "2025-02-03 00:00:00", "service": "orders-service",
          "http_status": "404", "response_time_ms": "500"},
     ]
-    result = build_windows(parsed(csv_file, rows), CONFIG)
+    records = parsed(csv_file, rows)
+    result = build_windows(records, CONFIG)
+    streamed = build_training_windows(lambda end: (r for r in records if r.timestamp.isoformat() < end),
+                                      [records[0], records[-1]], sorted({r.service for r in records}), CONFIG)
+    assert streamed.windows == [w for w in result.windows if w['split'] != 'test']
     first = select(result, "2025-02-03T00:00:00")
     business, health = first["business"], first["health"]
     assert first["record_count"] == 7

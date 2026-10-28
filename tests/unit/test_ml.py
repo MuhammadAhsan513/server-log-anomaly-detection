@@ -200,3 +200,40 @@ def test_ml_config_rejects_unknown_keys(tmp_path):
     path.write_text(json.dumps({**MLConfig().to_dict(), "test_percentile": 99}))
     with pytest.raises(InputError, match="unknown"):
         load_config(path, MLConfig)
+
+
+def test_model_schema_rejects_incompatible_saved_features_and_thresholds(prepared):
+    from log_anomaly.ml import validate_model_schema
+
+    result = run(prepared)
+    validate_model_schema(result.metadata, result.estimators)
+    for kind in ('version', 'order', 'path', 'threshold', 'identity', 'median'):
+        metadata = deepcopy(result.metadata)
+        model = next(iter(metadata['models'].values()))
+        prep = model['preprocessing']
+        if kind == 'version':
+            metadata['bundle_version'] = 'future'
+        elif kind == 'order':
+            prep['features'].reverse()
+        elif kind == 'path':
+            prep['features'][0]['path'] = ['unknown']
+        elif kind == 'threshold':
+            model['threshold']['threshold'] = float('nan')
+        elif kind == 'identity':
+            model['service'] = 'other-service'
+        else:
+            prep['medians'].clear()
+        with pytest.raises(InputError, match='incompatible model bundle'):
+            validate_model_schema(metadata, result.estimators)
+
+
+def test_new_endpoint_uses_only_its_own_service_scope_model(prepared):
+    result = run(prepared, replace(CONFIG, scopes=('endpoint',)))
+    window = deepcopy(next(w for w in prepared[0].windows if w['scope'] == 'endpoint'
+                           and w['window_minutes'] == 5 and w['split'] == 'test'))
+    new_endpoint = {**window, 'entity_key': '/new-endpoint', 'window_start': '2026-02-05T00:00:00',
+                    'window_end': '2026-02-05T00:05:00'}
+    other_service = {**new_endpoint, 'service': 'unseen-service'}
+    scores = score_windows(result.metadata, result.estimators, [window, new_endpoint, other_service])
+    assert scores[0] == scores[1]  # Same numerical features; identifiers do not enter the model.
+    assert scores[2]['status'] == 'ml_unavailable' and scores[2]['score'] is None

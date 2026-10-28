@@ -5,6 +5,7 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from itertools import groupby
 
 from .config import FeatureConfig, InputError
 from .ingest import NormalizedLog
@@ -21,7 +22,7 @@ class FeatureResult:
     service_statistics: dict[str, dict]
 
 
-def chronological_splits(records: list[NormalizedLog], config: FeatureConfig) -> dict:
+def chronological_splits(records: list[NormalizedLog], config: FeatureConfig, *, require_test=True) -> dict:
     if not records:
         raise InputError("features require accepted records")
     first = min(r.timestamp for r in records)
@@ -36,8 +37,11 @@ def chronological_splits(records: list[NormalizedLog], config: FeatureConfig) ->
         raise InputError("split dates exceed supported datetime range") from exc
     if first < start:
         raise InputError("accepted records precede split_start_day")
-    if end <= validation_end:
+    if require_test and end <= validation_end:
         raise InputError("input must span training, validation, and at least one test day")
+    if not require_test and last < train_end:
+        raise InputError("training requires historical training and validation observations")
+    end = max(end, validation_end)
     return {
         "train": {"start": start.isoformat(), "end": train_end.isoformat()},
         "validation": {"start": train_end.isoformat(), "end": validation_end.isoformat()},
@@ -138,19 +142,42 @@ def _populations(records: list[NormalizedLog], config: FeatureConfig,
             "health": health_stats}
 
 
-def build_windows(records: list[NormalizedLog], config: FeatureConfig) -> FeatureResult:
+def _window(start, minutes, service, scope, entity, members, config, ranges, vocabulary):
+    """Shared schema and arithmetic for in-memory and streamed aggregation."""
+    end = start + timedelta(minutes=minutes)
+    split = _split(start, ranges)
+    if end.isoformat() > ranges[split]["end"]:
+        raise ValueError("window straddles chronological split")
+    angle = 2 * math.pi * (start.hour + start.minute / 60) / 24
+    return {
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "window_start": start.isoformat(), "window_end": end.isoformat(),
+        "window_minutes": minutes, "service": service, "scope": scope,
+        "entity_key": entity, "split": split,
+        "hour_sin": math.sin(angle), "hour_cos": math.cos(angle),
+        "is_weekend": start.weekday() >= 5,
+        **_populations(members, config, vocabulary.get(service)),
+    }
+
+
+def build_windows(records: list[NormalizedLog], config: FeatureConfig, *,
+                  inference_ranges: dict | None = None,
+                  template_reference: dict | None = None) -> FeatureResult:
     """Build both resolutions. Service bins are dense; endpoint/auth-IP bins sparse.
 
     The analysis extent comprises whole source-local days, not asserted collection
     coverage. Templates are fit once per service on training records only. Training
-    novelty is in-sample membership, not a causal novelty detector.
+    novelty is in-sample membership, not a causal novelty detector. Inference
+    supplies frozen ranges/vocabulary and limits dense bins to the event span.
     """
-    ranges = chronological_splits(records, config)
-    vocabulary: dict[str, set[str]] = defaultdict(set)
+    ranges = inference_ranges or chronological_splits(records, config)
+    vocabulary: dict[str, set[str]] = defaultdict(
+        set, {k: set(v) for k, v in (template_reference or {}).items()})
     by_service = defaultdict(list)
     for record in records:
         by_service[record.service].append(record)
-        if _split(record.timestamp, ranges) == "train" and record.enrichment.message_template is not None:
+        if (inference_ranges is None and _split(record.timestamp, ranges) == "train"
+                and record.enrichment.message_template is not None):
             vocabulary[record.service].add(record.enrichment.message_template)
     windows = []
     for minutes in (config.window_minutes, config.alternate_window_minutes):
@@ -164,29 +191,56 @@ def build_windows(records: list[NormalizedLog], config: FeatureConfig) -> Featur
                     and record.enrichment.authentication_outcome in {"success", "failure"}
                     and record.endpoint not in config.health_endpoints):
                 groups[(start, record.service, "auth_ip", record.source_ip)].append(record)
-        start = datetime.fromisoformat(ranges["train"]["start"])
-        end = datetime.fromisoformat(ranges["test"]["end"])
+        start = (_floor(records[0].timestamp, minutes) if inference_ranges is not None
+                 else datetime.fromisoformat(ranges["train"]["start"]))
+        end = (records[-1].timestamp if inference_ranges is not None
+               else datetime.fromisoformat(ranges["test"]["end"]))
         while start < end:
             for service in by_service:
                 groups.setdefault((start, service, "service", service), [])
             start += timedelta(minutes=minutes)
         for (start, service, scope, entity), members in sorted(groups.items()):
-            end = start + timedelta(minutes=minutes)
-            split = _split(start, ranges)
-            if end.isoformat() > ranges[split]["end"]:
-                raise ValueError("window straddles chronological split")
-            angle = 2 * math.pi * (start.hour + start.minute / 60) / 24
-            windows.append({
-                "feature_schema_version": FEATURE_SCHEMA_VERSION,
-                "window_start": start.isoformat(), "window_end": end.isoformat(),
-                "window_minutes": minutes, "service": service, "scope": scope,
-                "entity_key": entity, "split": split,
-                "hour_sin": math.sin(angle), "hour_cos": math.cos(angle),
-                "is_weekend": start.weekday() >= 5,
-                **_populations(members, config, vocabulary.get(service)),
-            })
+            windows.append(_window(start, minutes, service, scope, entity, members, config, ranges, vocabulary))
     return FeatureResult(
         windows, ranges, {service: sorted(values) for service, values in sorted(vocabulary.items())},
         {service: _populations(members, config, vocabulary.get(service))
          for service, members in sorted(by_service.items())},
     )
+
+
+def build_training_windows(records, bounds: list[NormalizedLog], services: list[str],
+                           config: FeatureConfig) -> FeatureResult:
+    """Read a sorted record factory one time bin at a time; never retain historical logs.
+
+    Reuse the exact population statistics and window schema of build_windows.
+    Only train/validation windows are materialized; held-out data never enters fitting.
+    """
+    ranges = chronological_splits(bounds, config, require_test=False)
+    vocabulary = defaultdict(set)
+    for record in records(ranges["train"]["end"]):
+        if record.enrichment.message_template is not None:
+            vocabulary[record.service].add(record.enrichment.message_template)
+    windows = []
+    for minutes in (config.window_minutes, config.alternate_window_minutes):
+        bins = iter(groupby(records(ranges["validation"]["end"]),
+                            key=lambda r: _floor(r.timestamp, minutes)))
+        current = next(bins, None)
+        start = datetime.fromisoformat(ranges["train"]["start"])
+        stop = datetime.fromisoformat(ranges["validation"]["end"])
+        while start < stop:
+            groups = {(service, "service", service): [] for service in services}
+            if current is not None and current[0] == start:
+                for record in current[1]:
+                    groups[(record.service, "service", record.service)].append(record)
+                    if record.endpoint is not None:
+                        groups.setdefault((record.service, "endpoint", record.endpoint), []).append(record)
+                    if (record.service == "auth-service" and record.source_ip is not None
+                            and record.enrichment.authentication_outcome in {"success", "failure"}
+                            and record.endpoint not in config.health_endpoints):
+                        groups.setdefault((record.service, "auth_ip", record.source_ip), []).append(record)
+                current = next(bins, None)
+            end = start + timedelta(minutes=minutes)
+            for (service, scope, entity), members in sorted(groups.items()):
+                windows.append(_window(start, minutes, service, scope, entity, members, config, ranges, vocabulary))
+            start = end
+    return FeatureResult(windows, ranges, {k: sorted(v) for k, v in sorted(vocabulary.items())}, {})

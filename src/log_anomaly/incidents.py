@@ -397,7 +397,7 @@ def _link(incidents: list[dict], gap: timedelta) -> None:
                 f"there during overlapping intervals. Routing and timing do not establish the cause.")
 
 
-def report_limitations(timezone: str) -> list[str]:
+def report_limitations(timezone: str, *, inference: bool = False) -> list[str]:
     limitations = [
         "No ground-truth labels exist; every incident is an unconfirmed detection requiring human review.",
         "Severity review marks suspicious activity; warning/high mark rule-supported incident candidates.",
@@ -406,6 +406,8 @@ def report_limitations(timezone: str) -> list[str]:
         "Validation alerts lie in the ML calibration period; only test incidents are fully held out.",
         "Sample messages are reproduced from synthetic logs; redact them before sharing real data.",
     ]
+    if inference:
+        limitations = limitations[:3] + ["Sample messages are source evidence; redact them before sharing real data."]
     if timezone == "unspecified":
         limitations.append("Source timezone is unspecified; times are source-local, not UTC.")
     return limitations
@@ -435,7 +437,8 @@ def incident_counts(rule_signals: list[dict], ml_signals: list[dict], incidents:
 
 def validate_incident_report(report: dict, config: IncidentConfig) -> None:
     """Schema, policy and ordering checks performed before publication."""
-    if set(report) != {"schema_version", "run_id", "timezone", "incidents", "limitations"}:
+    required = {"schema_version", "run_id", "timezone", "incidents", "limitations"}
+    if not required <= report.keys() or report.keys() - required - {"provenance", "coverage", "counts"}:
         raise ValueError("incident report envelope mismatch")
     ids = [i["incident_id"] for i in report["incidents"]]
     if len(set(ids)) != len(ids):
@@ -497,7 +500,7 @@ def _md(value) -> str:
     return text
 
 
-def summary_markdown(report: dict, counts: dict) -> str:
+def summary_markdown(report: dict, counts: dict, *, inference: bool = False) -> str:
     incidents = report["incidents"]
     signals = counts["signals_by_split"]
     lines = [
@@ -516,6 +519,10 @@ def summary_markdown(report: dict, counts: dict) -> str:
         "`review` = suspicious activity requiring investigation; `warning`/`high` = rule-supported incident "
         "candidates. None is confirmed: confirmation requires human review or labels.", "",
     ]
+    if "coverage" in report:
+        lines += ["- Window scoring: " + _md(report["coverage"]["window_status_counts"]) + ".",
+                  "- ML unavailable (rules still apply): "
+                  + (", ".join(report["coverage"]["unavailable_models"]) or "none") + ".", ""]
     if not incidents:
         lines += ["**No incidents**: no rule or ML signal was emitted for this run.", ""]
     else:
@@ -528,7 +535,8 @@ def summary_markdown(report: dict, counts: dict) -> str:
             lines.append(f"| {i['incident_id']} | {i['split']} | {i['start_time']} – {i['end_time']} | "
                          f"{', '.join(i['services'])} | {i['category']} | {_md(entity)} | {i['severity']} | "
                          f"{i['confidence']} | {', '.join(i['detector_ids'])} | {i['evidence']['record_count']} |")
-        lines += ["", "## Held-out incident details (validation and test)", "",
+        lines += ["", ("## Inference incident details" if inference
+                          else "## Held-out incident details (validation and test)"), "",
                   "One block per group of related incidents, describing its highest-severity member.", ""]
         by_id = {i["incident_id"]: i for i in incidents}
         shown = set()
@@ -551,7 +559,7 @@ def summary_markdown(report: dict, counts: dict) -> str:
                 f"### {i['incident_id']}", "",
                 f"- Category / severity / confidence: {i['category']} / {i['severity']} / {i['confidence']}",
                 f"- Affected: {', '.join(i['services'])}; entity {_md(i['entity'])}",
-                f"- Detection mode: {MODES[i['split']]}",
+                f"- Detection mode: {'inference: rules and ML frozen' if inference else MODES[i['split']]}",
                 f"- Window [{i['start_time']}, {i['end_time']}); evidence {i['first_evidence_time']} – "
                 f"{i['last_evidence_time']}; {evidence['record_count']} source records",
                 f"- Peak observed: {_md(i['observed_metrics'])}; baseline: {_md(i['baseline_metrics'])}",

@@ -19,4 +19,4 @@ jobs:
       - name: Seeded evaluation and measured failure regression
         run: python scripts/evaluate_fixtures.py --seeds 11 --output artifacts/ci-evaluation
       - name: Raw CSV to validated reports with release configuration
-        run: python -m log_anomaly run --input artifacts/ci-evaluation/seed-11/fixture/logs.csv --config configs/default.json --output artifacts/ci-run
+        run: python -m log_anomaly run --debug-artifacts --input artifacts/ci-evaluation/seed-11/fixture/logs.csv --config configs/default.json --output artifacts/ci-run
